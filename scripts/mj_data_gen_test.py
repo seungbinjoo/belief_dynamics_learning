@@ -14,8 +14,8 @@ from belief_dynamics_learning.mujoco_utils import sim_and_show_candidate_traj
 from belief_dynamics_learning.mujoco_utils import compute_gt_rollout
 
 
-def compute_dist_and_contact_point(gt_rollout, q_traj, system, box_dims): 
-    q_robot_poses = np.concatenate([q_traj, np.zeros((q_traj.shape[0], 2))], axis=1)
+def compute_dist_and_contact_point(gt_rollout, system, box_dims): 
+    q_robot_poses = gt_rollout[:, :, :9] # (num_time_steps, num_particles, 9)
     object_poses = gt_rollout[:, :, system.model.nq-7:system.model.nq] # (1, num_time_steps, 7) 
 
     object_poses_list = [object_poses[:, i, :] for i in range(object_poses.shape[1])] # list of length num_time_steps with shape (num_particles, 7)
@@ -50,9 +50,10 @@ if __name__ == "__main__":
     TrajSampler = TrajectorySampler()
     q_traj_list = TrajSampler.generate_trajs(q_start, system, xd.reshape(1, -1))
     q_traj = q_traj_list[0]
+
     print(q_traj.shape)
     # sim_and_show_candidate_traj(system, q_traj)
     gt_rollout = compute_gt_rollout(system, q_traj, pose_obj_init) 
     print(gt_rollout.shape)
 
-    dists, closest_pointss = compute_dist_and_contact_point(gt_rollout, q_traj, system, box_dims)
+    dists, closest_pointss = compute_dist_and_contact_point(gt_rollout, system, box_dims)
