@@ -73,6 +73,10 @@ class World2D:
         self.weights = np.ones(num_particles) / num_particles
         self.dt = dt
         self.bounds = np.array([[-0.5, 0.5], [0.5, 1.5]])
+        # reduce bounds for sampling
+        self.sample_bounds = self.bounds.copy()
+        self.sample_bounds[:,0] += 0.1
+        self.sample_bounds[:,1] -= 0.1
         # random walk motion model
         self.A = np.array([[1., 0., self.dt, 0.], 
                            [0., 1., 0., self.dt], 
@@ -81,6 +85,25 @@ class World2D:
 
         self.B = np.array([[0.5 * self.dt**2, 0, self.dt, 0], 
                            [0, 0.5 * self.dt**2, 0, self.dt]]).T
+        
+    def sample_gt_object_pose(self):
+        """
+        Sample a new ground truth object pose. 
+        """
+        qo_gt_new = np.zeros(3)
+        qo_gt_new[:2] = np.random.uniform(self.sample_bounds[:, 0], self.sample_bounds[:, 1])
+        qo_gt_new[2] = np.random.uniform(0, np.pi)
+        self.qo_gt = qo_gt_new
+        print("New ground truth pose: ", self.qo_gt)
+
+    def sample_robot_pose(self):
+        """
+        Sample a new robot pose. 
+        """
+        qr_new = np.zeros(2)
+        qr_new = np.random.uniform(self.sample_bounds[:, 0], self.sample_bounds[:, 1])
+        self.q_r_0 = qr_new
+        print("New robot pose: ", self.q_r_0)
 
     def generate_particles(self, sigma_pos):
         """
@@ -121,16 +144,26 @@ class World2D:
         plot_object(ax, self.qo_gt, self.obj_dims, color=gt_color)
         plt.show()
 
-    def plot_single_step(self, q_r, q_o, closest_point, deflected_pos): 
+    def plot_single_step(self, q_r_des, q_r_actual, q_o): 
         fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
         ax.set_aspect('equal')
         ax.set_xlim(self.bounds[0])
         ax.set_ylim(self.bounds[1])
-        plot_robot(ax, q_r, self.r_robot, color=robot_color)
+        plot_robot(ax, q_r_actual, self.r_robot, color=robot_color)
+        plot_robot(ax, q_r_des, self.r_robot, color='r', alpha=0.5)
         plot_object(ax, q_o, self.obj_dims, color=gt_color, zorder=0)
-        ax.plot([q_r[0], closest_point[0]], [q_r[1], closest_point[1]], '--', color='r')
-        ax.scatter(closest_point[0], closest_point[1], color='r', s=10)
-        plot_robot(ax, deflected_pos, self.r_robot, color='r', alpha=0.2)
+        # build legend 
+        rectangle_patch0 = patches.Rectangle((0, 0), self.obj_dims[0], self.obj_dims[1], 
+                                            color=gt_color, label='Ground truth')
+        # circle_patch = patches.Circle((0, 0), r_robot, color=robot_color, label='Robot')
+        circle_patch0 = Line2D([0], [0], marker='o', color=robot_color, 
+                            markerfacecolor=robot_color, markersize=10)
+        circle_patch1 = Line2D([0], [0], marker='o', color='r', 
+                            markerfacecolor='r', markersize=10, alpha=0.5)
+
+        ax.legend(handles=[circle_patch0, circle_patch1, rectangle_patch0],
+                    labels=[r'$q_{r,real}$', r'$q_{r,des}$', 'Ground truth (GT)'],
+                    loc='upper left', fontsize=14)
         plt.show()
 
     def step(self, x, q_o, sigma_a=0.5):
@@ -160,6 +193,7 @@ class World2D:
             # Reflect velocity if we hit the bounds
             x_new[2:] *= -1
 
+        q_des = x_new[:2].copy()
         # if in contact, deflect the robot
         if d < 0:
             o = 1 # contact observation
@@ -167,7 +201,7 @@ class World2D:
             x_new[2:] = -x_new[2:]
             # Clip robot to rectangle surface
             R_object = np.array([[np.cos(q_o[2]), -np.sin(q_o[2])], [np.sin(q_o[2]), np.cos(q_o[2])]])
-            q_r_o = R_object @ (x_new[:2] - q_o[:2])
+            q_r_o = R_object.T @ (x_new[:2] - q_o[:2])
             # find closest point on object surface
             q_r_o_normalized = q_r_o / (self.obj_dims/2) # 1 if on the surface
             if np.abs(q_r_o_normalized[0]) > 1 and np.abs(q_r_o_normalized[1]) > 1:
@@ -179,17 +213,17 @@ class World2D:
             else:
                 # move to y border
                 q_o_closest = np.array([q_r_o_normalized[0], np.sign(q_r_o_normalized[1])])
-            print(q_o_closest)
             q_o_closest *= self.obj_dims/2
             dq_r_o_new = q_r_o - q_o_closest
             dq_r_o_new *= self.r_robot / np.linalg.norm(dq_r_o_new)
             q_r_o_new = q_o_closest + dq_r_o_new
-            x_new[:2] = np.dot(R_object.T, q_r_o_new) + q_o[:2]
+            x_new[:2] = np.dot(R_object, q_r_o_new) + q_o[:2]
+            # self.plot_single_step(q_des, x_new[:2], q_o)
         else: 
             o = 0
         # clip velocity
         x_new[2:] = np.clip(x_new[2:], -0.5, 0.5)
-        return x_new, o
+        return x_new, o, q_des 
 
     def rollout(self, num_steps, q_o):
         """
@@ -203,15 +237,17 @@ class World2D:
         q_r = self.q_r_0
         q_r_hist = [q_r]
         o_hist = [0]
+        action_hist = []
         v0_mean = np.zeros(2)
         # sample initial vel 
         v0 = np.random.normal(v0_mean, 0.1)
         x = np.concatenate([q_r, v0])
         for t in range(num_steps):
-            x,o = self.step(x, q_o)
+            x,o, q_des = self.step(x, q_o)
+            action_hist.append(q_des)
             q_r_hist.append(x[:2])
             o_hist.append(o)
-        return np.array(q_r_hist), np.array(o_hist)
+        return np.array(q_r_hist), np.array(o_hist), np.array(action_hist)
     
 
 if __name__ == '__main__': 
