@@ -94,7 +94,7 @@ class World2D:
         qo_gt_new[:2] = np.random.uniform(self.sample_bounds[:, 0], self.sample_bounds[:, 1])
         qo_gt_new[2] = np.random.uniform(0, np.pi)
         self.qo_gt = qo_gt_new
-        print("New ground truth pose: ", self.qo_gt)
+        # print("New ground truth pose: ", self.qo_gt)
 
     def sample_robot_pose(self):
         """
@@ -103,7 +103,7 @@ class World2D:
         qr_new = np.zeros(2)
         qr_new = np.random.uniform(self.sample_bounds[:, 0], self.sample_bounds[:, 1])
         self.q_r_0 = qr_new
-        print("New robot pose: ", self.q_r_0)
+        # print("New robot pose: ", self.q_r_0)
 
     def generate_particles(self, sigma_pos):
         """
@@ -135,7 +135,6 @@ class World2D:
         ax.set_aspect('equal')
         ax.set_xlim(self.bounds[0])
         ax.set_ylim(self.bounds[1])
-        ax.plot(self.q_r_0[0], self.q_r_0[1], 'o', color=robot_color)
         ax.plot(q_r_hist[:, 0], q_r_hist[:, 1], 'o-', color=robot_color, alpha=0.5)
         contact_points = np.where(o_hist == 1)[0]
         for idx in contact_points:
