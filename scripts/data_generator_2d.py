@@ -42,7 +42,7 @@ def generate_dataset(world, num_sequences, num_steps_per_sequence):
             a_hist = a_hist[keep_idx[0]:keep_idx[1]]
         # save the sequence to a dataset
         data.append((q_r_hist, o_hist, a_hist))
-    
+    return data
 
 if __name__ == "__main__":
     num_particles = 100
@@ -60,6 +60,6 @@ if __name__ == "__main__":
     # generate a dataset
     data = generate_dataset(world, 100, 100)
     # save the dataset to a file
-    save_path = root + '../data/data.pkl'
-    with open('data.pkl', 'wb') as f: 
-        pickle.dump(save_path, f)
+    save_path = os.path.join(root, '../data/data.pkl')
+    with open(save_path, 'wb') as f: 
+        pickle.dump(data, f)
