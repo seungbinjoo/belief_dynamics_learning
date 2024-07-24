@@ -38,6 +38,7 @@ class DPF():
         
         # device configuration --> use GPU if available
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   
+        print('Using device:', self.device)
 
         # PARTICLE PROPOSER --> maps observations and robot poses to particles
         self.particle_proposer = ParticleProposer(self.proposer_keep_ratio).to(self.device)
@@ -57,11 +58,14 @@ class DPF():
         """
 
         # prepare input to the observation likelihood estimator network
+        q_r_desired = q_r_desired.float().to(self.device) # shape [batch_size, 2]
+        q_r_achieved = q_r_achieved.float().to(self.device) # shape [batch_size, 2]
+        observation = observation.float().to(self.device) # shape [batch_size, 1]
         observation_input = torch.cat((q_r_desired, q_r_achieved, observation), dim=-1) # shape [batch_size, 5]
         observation_input = torch.tile(observation_input[:, None, :], (1, particles.shape[1], 1)) # shape [batch_size, num_particles, 5]
         particle_input = self.transform_particles_as_input(particles, means, stds) # shape [batch_size, num_particles, 4]
         input = torch.cat((observation_input, particle_input), dim=-1) # shape [batch_size, num_particles, 9]
-        input = input.view(-1, input.shape[-1]).float() # shape [batch_size * num_particles, 9]
+        input = input.view(-1, input.shape[-1]).float().to(self.device) # shape [batch_size * num_particles, 9]
 
         # for each particle, estimate the likelihood based on the observation
         obs_likelihood = self.obs_like_estimator(input) # pass input particle set through the observaton likelihood estimator network
@@ -88,7 +92,7 @@ class DPF():
 
         input_pp = torch.cat((q_r_desired, q_r_achieved, observation), dim=-1) # shape [batch_size, 5]
         duplicated_input_pp = torch.tile(input_pp[:, None, :], (1, num_particles, 1)) # duplicate the input 'num_particles' times so we generate multiple particles, shape [batch_size, num_particles, 5]
-        duplicated_input_pp = duplicated_input_pp.view(-1, 5).float() # shape [batch_size * num_particles, 5]
+        duplicated_input_pp = duplicated_input_pp.view(-1, 5).float().to(self.device) # shape [batch_size * num_particles, 5]
         
         # normalise??
         # duplicated_input_pp = torch.nn.functional.normalize(duplicated_input_pp, p=2.0, dim=0)
@@ -141,10 +145,13 @@ class DPF():
 
             # training loop: for each epoch, go through multiple batches --> e.g. q_o batch has dimensions [batch_size, seq_len, 3]
             for i, batch in enumerate(train_dataloader):
-
+                # load to gpu 
+                batch = {k: v.float().to(self.device) for k, v in batch.items()}
                 # initialise matrix to store particles
-                particle_list = torch.zeros([batch_size, seq_len, num_particles, self.state_dim], dtype=torch.float64)
-                particle_prob_list = torch.zeros([batch_size, seq_len, num_particles], dtype=torch.float64)
+                particle_list = torch.zeros([batch_size, seq_len, num_particles, self.state_dim], 
+                                            dtype=torch.float64, device=self.device)
+                particle_prob_list = torch.zeros([batch_size, seq_len, num_particles], 
+                                                 dtype=torch.float64, device=self.device)
 
                 # for each time step
                 for t in range(seq_len):
@@ -237,8 +244,13 @@ class DPF():
             print('Desired robot position during contact event:', q_r_desired[None, :])
             print('Achieved robot position during contact event:', q_r_achieved[None, :])
             print('Observation during contact event:', observation[None, :])
-            self.world.particles = self.propose_particles(q_r_desired[None, :], q_r_achieved[None, :], observation[None, :], self.world.num_particles, state_mins, state_maxs)
-            self.world.particles = self.world.particles.squeeze(0)
+            state_mins = torch.from_numpy(state_mins).to(self.device)
+            state_maxs = torch.from_numpy(state_maxs).to(self.device)
+            self.world.particles = self.propose_particles(
+                q_r_desired[None, :], q_r_achieved[None, :], 
+                observation[None, :], self.world.num_particles, 
+                state_mins, state_maxs)
+            self.world.particles = self.world.particles.squeeze(0).cpu().numpy()
             self.world.q_r_0 = q_r_hist[contact_idx_new[0], :]
             # self.world.weights = self.measurement_update(q_r_desired[None, :], q_r_achieved[None, :], observation[None, :], self.world.particles[:, :, None, :], means, stds)
 
@@ -253,7 +265,7 @@ class DPF():
         self.num_particles = num_particles
 
         # initialise particles --> samples particles randomly according to uniform distribution between state minimums and maximums
-        initial_particles = [torch.rand(self.batch_size, self.num_particles, 1) for d in range(self.state_dim)] # generate tensors of shape [batch_size, num_particles, 1] with values between 0 and 1
+        initial_particles = [torch.rand(self.batch_size, self.num_particles, 1, device=self.device) for d in range(self.state_dim)] # generate tensors of shape [batch_size, num_particles, 1] with values between 0 and 1
         initial_particles = torch.cat([(state_mins[d] - state_maxs[d]) * initial_particles[d] + state_maxs[d] for d in range(self.state_dim)], dim=-1) # rescale to range (state_min, state_max) and concatenate
 
         # initial particle probabilities --> distribute particle weights uniformly
@@ -296,14 +308,14 @@ class DPF():
                 
                 # resampling
                 evenly_spaced_markers = torch.linspace(0.0, (num_resampled_float - 1.0) / num_resampled, num_resampled) # 'num_resampled' evenly spaced markers from 0 to 1
-                random_offset = torch.rand(self.batch_size) # generate a tensor of shape [batch_size] filled with random values between 0 and 1
+                random_offset = torch.rand(self.batch_size, device=self.device) # generate a tensor of shape [batch_size] filled with random values between 0 and 1
                 random_offset *= random_offset * (1 / num_resampled_float) # tensor has shape [batch_size] and is filled with random values between 0 and 1 / num_resampled
                 markers = random_offset[:, None] + evenly_spaced_markers[None, :] # broadcast to get shape [batch_size, num_resampled]
                 cum_probs = torch.cumsum(particle_probs, dim=1) # particle_probs has shape [batch_size, num_particles] --> take cum_sum along second dimension
                 marker_matching = markers[:, :, None] < cum_probs[:, None, :] # broadcasting to create a boolean tensor [batch_size, num_resampled, num_particles], where entry is 'True' if marker < cum prob
                 samples = torch.argmax(marker_matching.int(), dim=2).int() # for each batch, each particle to resample, extract index of the first 'True' along the last dimension of 'marker_matching'
                 standard_particles = permute_batch(particles, samples) # pick and permute particle samples from 'particles' according to indices specified in 'samples' --> shape [batch_size, sample_size, state_dim]
-                standard_particle_probs = torch.ones(self.batch_size, num_resampled) # initialise tensor to store resampled particle probabilities --> shape [batch_size, sample_size]
+                standard_particle_probs = torch.ones(self.batch_size, num_resampled, device=self.device) # initialise tensor to store resampled particle probabilities --> shape [batch_size, sample_size]
                 standard_particles = standard_particles.detach() # stop gradient computation??
                 standard_particle_probs = standard_particle_probs.detach() # stop gradient computation??
 
