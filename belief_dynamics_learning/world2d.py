@@ -1,5 +1,6 @@
 import numpy as np
 import time 
+import torch
 from belief_dynamics_learning.belief_plotting_2d import *
 
 # colors 
@@ -61,6 +62,67 @@ def dist_to_object_batch(q_r, q_o, dim_object, r_robot):
     d = np.linalg.norm(q_r_o - q_r_o_clipped, axis=1) - r_robot # [N]
     return d
 
+def dist_to_object_torch(q_r, q_o, dim_object, r_robot):
+    """
+    Compute the shortest distance between the robot and the object.
+    Args:
+        q_r: robot pose [3] (tensor)
+        q_o: object pose [3] (tensor)
+        dim_object: object dimensions [2] (tensor) - assuming rectangle
+        r_robot: robot radius (scalar)
+    Returns:   
+        d: shortest distance (tensor)
+        closest_point: closest point on the object to the robot 
+                       (in the robot frame) (tensor)
+    """
+    # print('robot pose:', q_r)
+    # print('proposed particle = predicted object pose:', q_o)
+    # Compute robot position in object frame
+    sin_o = torch.sin(q_o[2])
+    cos_o = torch.cos(q_o[2])
+    R = torch.tensor([[cos_o, sin_o], [-sin_o, cos_o]])
+    q_r_o = torch.matmul(R, (q_r[:2] - q_o[:2]))
+    
+    # Clip robot to rectangle
+    q_r_o_clipped = torch.clamp(q_r_o, torch.from_numpy(-dim_object/2), torch.from_numpy(dim_object/2))
+    
+    # Compute distance
+    d = torch.norm(q_r_o - q_r_o_clipped) - r_robot
+    # print('distance:', d)
+    
+    # Convert the closest point back to the robot frame
+    # R_inv = torch.linalg.inv(R)
+    # closest_point = torch.matmul(R_inv, q_r_o_clipped) + q_o[:2]
+    
+    # return d, closest_point
+    return d
+
+def dist_to_object_batch_torch(q_r, q_o, dim_object, r_robot):
+    """
+    Compute the shortest distance between the robot and the object in batch. 
+    Args: 
+        q_r: robot pose [3] (tensor)
+        q_o: object poses [N, 3] (tensor)
+        dim_object: object dimensions [2] (tensor)
+        r_robot: robot radius (scalar)
+    Returns:
+        d: shortest distances for each possible object pose to 
+           given robot pose [N] (tensor)
+    """
+    # Compute robot position in object frame
+    sin_o = torch.sin(q_o[:, 2])
+    cos_o = torch.cos(q_o[:, 2])
+    R = torch.stack([torch.stack([cos_o, sin_o], dim=1), torch.stack([-sin_o, cos_o], dim=1)], dim=1)  # [N, 2, 2]
+    q_r_o = torch.einsum('nij,nj->ni', R, q_r[:2] - q_o[:, :2])  # [N, 2]
+    
+    # Clip robot to rectangle
+    q_r_o_clipped = torch.clamp(q_r_o, -dim_object / 2, dim_object / 2)  # [N, 2]
+    
+    # Compute distance
+    d = torch.norm(q_r_o - q_r_o_clipped, dim=1) - r_robot  # [N]
+    
+    return d
+
 class World2D:
     def __init__(self, num_particles, gt_obj_pose, 
                  obj_dims, sigma_pos, q_r_0, r_robot, dt):
@@ -92,7 +154,7 @@ class World2D:
         """
         qo_gt_new = np.zeros(3)
         qo_gt_new[:2] = np.random.uniform(self.sample_bounds[:, 0], self.sample_bounds[:, 1])
-        qo_gt_new[2] = np.random.uniform(0, np.pi)
+        qo_gt_new[2] = np.random.uniform(-np.pi, np.pi) # used to be: (0, np.pi)
         self.qo_gt = qo_gt_new
         # print("New ground truth pose: ", self.qo_gt)
 
@@ -117,7 +179,7 @@ class World2D:
         # sample positions from a Gaussian distribution (for now)
         particles[:, :2] = np.random.multivariate_normal(self.qo_gt[:2], sigma_qo_pos, self.num_particles)
         # sample yaw angles uniformly 
-        particles[:, 2] = np.random.uniform(0, np.pi, self.num_particles)
+        particles[:, 2] = np.random.uniform(-np.pi, np.pi, self.num_particles)
         return particles
     
     def plot_belief(self):
