@@ -16,7 +16,7 @@ class DPF():
         to predict the belief at the next time step.
         Args:
             propose_ratio: ratio of proposed to resampled particles
-            proposer_keep_ratio: dropout ratio for particle proposer network, used in inference to introduce randomness to particle proposer network
+            proposer_keep_ratio: dropout ratio for particle proposer network, used during training and inference to introduce randomness to particle proposer network
             min_obs_likelihood: lower limit for observation likelihood produced by the observation likelihood estimate
             world: object of class World2D
         """
@@ -59,9 +59,9 @@ class DPF():
         # prepare input to the observation likelihood estimator network
         observation_input = torch.cat((q_r_desired, q_r_achieved, observation), dim=-1) # shape [batch_size, 5]
         observation_input = torch.tile(observation_input[:, None, :], (1, particles.shape[1], 1)) # shape [batch_size, num_particles, 5]
-        particle_input = self.transform_particles_as_input(particles, means, stds) # shape [batch_size, num_particles, 3]
-        input = torch.cat((observation_input, particle_input), dim=-1) # shape [batch_size, num_particles, 8]
-        input = input.view(-1, 8).float() # shape [batch_size * num_particles, 8]
+        particle_input = self.transform_particles_as_input(particles, means, stds) # shape [batch_size, num_particles, 4]
+        input = torch.cat((observation_input, particle_input), dim=-1) # shape [batch_size, num_particles, 9]
+        input = input.view(-1, input.shape[-1]).float() # shape [batch_size * num_particles, 9]
 
         # for each particle, estimate the likelihood based on the observation
         obs_likelihood = self.obs_like_estimator(input) # pass input particle set through the observaton likelihood estimator network
@@ -76,22 +76,32 @@ class DPF():
         means_q_o = torch.tensor(means['q_o'], device=self.device)
         stds_q_o = torch.tensor(stds['q_o'], device=self.device)
 
-        return (particles - means_q_o) / stds_q_o # should the angle state theta be divided into two states, cos and sin theta?
+        input = torch.cat((
+            (particles[:, :, :2] - means_q_o[None, None, :2]) / stds_q_o[None, None, :2],
+            torch.cos(particles[:, :, 2:3]),
+            torch.sin(particles[:, :, 2:3])),
+            dim=-1)
+
+        return input # should the angle state theta be divided into two states, cos and sin theta?
     
     def propose_particles(self, q_r_desired, q_r_achieved, observation, num_particles, state_mins, state_maxs):
 
         input_pp = torch.cat((q_r_desired, q_r_achieved, observation), dim=-1) # shape [batch_size, 5]
         duplicated_input_pp = torch.tile(input_pp[:, None, :], (1, num_particles, 1)) # duplicate the input 'num_particles' times so we generate multiple particles, shape [batch_size, num_particles, 5]
         duplicated_input_pp = duplicated_input_pp.view(-1, 5).float() # shape [batch_size * num_particles, 5]
-        proposed_particles = self.particle_proposer(duplicated_input_pp) # shape [batch_size * num_particles, 3]
-        proposed_particles = proposed_particles.view(q_r_achieved.shape[0], num_particles, 3) # shape [batch_size, num_particles, 3]
+        
+        # normalise??
+        # duplicated_input_pp = torch.nn.functional.normalize(duplicated_input_pp, p=2.0, dim=0)
+        # print(duplicated_input_pp)
 
-        # outputs from particle proposer are between 0 and 1 --> scale according to state maximums and minimums
-        proposed_particles = torch.cat([
+        proposed_particles = self.particle_proposer(duplicated_input_pp) # shape [batch_size * num_particles, 4]
+        proposed_particles = proposed_particles.view(q_r_achieved.shape[0], num_particles, 4) # shape [batch_size, num_particles, 4]
+        # outputs from particle proposer are between -1 and 1 --> scale according to state maximums and minimums
+        proposed_particles = torch.cat((
             proposed_particles[:, :, :1] * (state_maxs[0] - state_mins[0]) / 2.0 + (state_maxs[0] + state_mins[0]) / 2.0,
             proposed_particles[:, :, 1:2] * (state_maxs[1] - state_mins[1]) / 2.0 + (state_maxs[1] + state_mins[1]) / 2.0,
-            proposed_particles[:, :, 2:3] * (state_maxs[2] - state_mins[2]) / 2.0 + (state_maxs[2] + state_mins[2]) / 2.0,
-        ], dim=-1)
+            torch.atan2(proposed_particles[:, :, 3:4], proposed_particles[:, :, 2:3]))
+            , dim=-1)
         
         return proposed_particles
     
@@ -112,10 +122,12 @@ class DPF():
         means, stds, q_o_maxs, q_o_mins, q_r_step_sizes, q_r_maxs, q_r_mins = compute_statistics(train_data)
 
         # optimiser and loss
-        optimiser_e2e = torch.optim.Adam([
-            {'params': self.particle_proposer.parameters()},
-            {'params': self.obs_like_estimator.parameters()}],
-            lr=learning_rate)
+        # EXPERIMENT: disable ole network and just have the particle_prob_list be uniform probability every sequence
+        # optimiser_e2e = torch.optim.Adam([
+        #     {'params': self.particle_proposer.parameters()},
+        #     {'params': self.obs_like_estimator.parameters()}],
+        #     lr=learning_rate)
+        optimiser_e2e = torch.optim.SGD(self.particle_proposer.parameters(), lr=learning_rate)
         loss_fn = loss_fn_e2e()
 
         # initialise variables needed in the training loop
@@ -146,14 +158,23 @@ class DPF():
                     q_r_desired = batch_t['a'].squeeze(1) # desired robot pose is action from previous time step --> shape [batch_size, 2]
                     q_r_achieved = batch_t['q_r'].squeeze(1) # shape [batch_size, 2]
                     observation = batch_t['o'] # shape [batch_size, 1]
+
+                    # test print - for debugging
+                    # print(q_o)
+                    # print(q_r_desired)
+                    # print(q_r_achieved)
+                    # print(observation)
                     
                     # propose particles
                     proposed_particles = self.propose_particles(q_r_desired, q_r_achieved, observation, num_particles, q_o_mins, q_o_maxs)
                     particle_list[:, t, :, :] = proposed_particles
                     
                     # observation likelihood estimator network
-                    particle_probs = self.measurement_update(q_r_desired, q_r_achieved, observation, proposed_particles, means, stds)
-                    particle_prob_list[:, t, :] = particle_probs
+                    # particle_probs = self.measurement_update(q_r_desired, q_r_achieved, observation, proposed_particles, means, stds)
+                    # particle_prob_list[:, t, :] = particle_probs
+
+                # EXPERIMENT: disable ole network and just have the particle_prob_list be uniform probability every sequence
+                particle_prob_list = torch.ones([batch_size, seq_len, num_particles], dtype=torch.float64) / num_particles
 
                 # compute loss
                 train_loss = loss_fn(batch, particle_list, particle_prob_list, q_r_step_sizes) # do we need step sizes here?? object doesn't move...
@@ -204,6 +225,7 @@ class DPF():
             buffer_ub = np.min([len(o_hist)-max_idx, 10])
             keep_idx = [min_idx-buffer_lb, max_idx+buffer_ub]
             q_r_hist = q_r_hist[keep_idx[0]:keep_idx[1]]
+            a_hist = a_hist[keep_idx[0]:keep_idx[1]]
             o_hist = o_hist[keep_idx[0]:keep_idx[1]]
             contact_idx_new = np.where(o_hist==1)[0]
             self.world.plot_rollout(q_r_hist, o_hist)
@@ -212,9 +234,13 @@ class DPF():
             q_r_desired = torch.from_numpy(a_hist[contact_idx_new[0]-1, :])
             q_r_achieved = torch.from_numpy(q_r_hist[contact_idx_new[0], :])
             observation = torch.from_numpy(np.array([o_hist[contact_idx_new[0]]]))
+            print('Desired robot position during contact event:', q_r_desired[None, :])
+            print('Achieved robot position during contact event:', q_r_achieved[None, :])
+            print('Observation during contact event:', observation[None, :])
             self.world.particles = self.propose_particles(q_r_desired[None, :], q_r_achieved[None, :], observation[None, :], self.world.num_particles, state_mins, state_maxs)
             self.world.particles = self.world.particles.squeeze(0)
             self.world.q_r_0 = q_r_hist[contact_idx_new[0], :]
+            # self.world.weights = self.measurement_update(q_r_desired[None, :], q_r_achieved[None, :], observation[None, :], self.world.particles[:, :, None, :], means, stds)
 
             # plot belief
             self.world.plot_belief()
@@ -361,15 +387,15 @@ class ParticleProposer(nn.Module):
     def __init__(self, proposer_keep_ratio):
         super().__init__()
         self.linear_stack = nn.Sequential(
-            nn.Linear(5, 16),
+            nn.Linear(5, 32),
             nn.ReLU(),
             nn.Dropout(p=proposer_keep_ratio),
-            nn.Linear(16, 16),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(16, 16),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(16, 3),
-            nn.Sigmoid(), # sigmoid maps to between 0 and 1
+            nn.Linear(32, 4),
+            nn.Tanh(), # tanh maps to between -1 and 1
         )
 
     # define the forward pass of the network (how input data x moves through network layers)
@@ -384,7 +410,7 @@ class ObsLikelihoodEstimator(nn.Module):
     def __init__(self, min_obs_likelihood):
         super().__init__()
         self.linear_stack = nn.Sequential(
-            nn.Linear(8, 32),
+            nn.Linear(9, 32),
             nn.Linear(32, 1),
             nn.Sigmoid(),
         )
@@ -428,10 +454,101 @@ class loss_fn_e2e(nn.Module):
         super(loss_fn_e2e, self).__init__()
 
     def forward(self, batch, particle_list, particle_prob_list, state_step_sizes):
-        std = 0.05
+        std = 0.2
+        particle_std = 0.2
+        print('particle_list', particle_list[0, 0, :10, :])
+        print('batch_q_o:', batch['q_o'][0, 0, :])
+        print('state_step_sizes:', state_step_sizes)
         sq_distance = compute_sq_distance(particle_list, batch['q_o'], state_step_sizes) # shape: [batch_size, seq_len, num_particles]
+        print('sq_distance:', sq_distance[0, 0, :10])
         std_tensor = torch.tensor(2.0 * np.pi * (std ** 2.0))
-        activations = particle_prob_list / torch.sqrt(std_tensor) * torch.exp(-sq_distance / (2.0 * std * 2.0)) # shape: [batch_size, seq_len, num_particles]
-        loss = torch.mean(-torch.log(1e-16 + torch.sum(activations, -1)))
+        print('std_tensor:', std_tensor)
+        activations = (particle_prob_list / torch.sqrt(std_tensor)) * torch.exp(-sq_distance / (2.0 * particle_std ** 2.0)) # shape: [batch_size, seq_len, num_particles]
+        print('activations:', activations[0, 0, :10])
+        loss = torch.mean(-torch.log(1e-16 + torch.sum(activations, dim=-1)))
+        print(torch.sum(activations, dim=-1))
+        print('loss:', loss)
+        return loss
+
+# class that defines loss function that computes the distance between each particle and the robot pose, sums the distances up for the particle set, averages the sum of distances across timesteps and batches
+class loss_fn_dist_to_robot_A(nn.Module):
+    def __init__(self):
+        super(loss_fn_dist_to_robot_A, self).__init__()
+
+    def forward(self, batch, particle_list, particle_prob_list, state_step_sizes, world):
+        batch_q_o = batch['q_o'] # shape [batch_size, 1, state_dim]
+        batch_q_o = batch_q_o[:, :, None, :] # add dimension to tensor containing batch of object poses --> shape [batch_size, 1, 1, state_dim]
+        batch_q_r = batch['q_r'] # shape [batch_size, seq_len, 2]
+        distances = torch.zeros(batch_q_o.shape[0], particle_list.shape[1], particle_list.shape[2]) # shape [batch_size, seq_len, num_particles]
+        # particle_list has shape [batch_size, seq_len, num_particles, state_dim]
+        for batch in range(batch_q_o.shape[0]):
+            for t in range(particle_list.shape[1]):
+                for particle in range(particle_list.shape[2]):
+                    distances[batch, t, particle] = dist_to_object_torch(batch_q_r[batch, t, :], particle_list[batch, t, particle, :], world.obj_dims, world.r_robot)
+        loss = torch.mean(torch.sum(particle_prob_list * distances, dim=-1))
+        # normalise smth?
+        return loss
+
+# loss function above but simpler --> simply calculate squared distance between robot and particle (ignore angle of object pose)
+class loss_fn_dist_to_robot_B(nn.Module):
+    def __init__(self):
+        super(loss_fn_dist_to_robot_B, self).__init__()
+
+    def forward(self, batch, particle_list, particle_prob_list, state_step_sizes):
+        batch_q_r = batch['q_r'][:, :, None, :] # shape [batch_size, seq_len, 1, 2] = [20, 100, 1, 2]
+        
+        # distances has shape [batch_size, seq_len, num_particles]
+        # particle_list has shape [batch_size, seq_len, num_particles, state_dim]
+        x_distance = (batch_q_r[:, :, :, 0] - particle_list[:, :, :, 0])
+        y_distance = (batch_q_r[:, :, :, 1] - particle_list[:, :, :, 1])
+        squared_distance = (x_distance ** 2.0) + (y_distance ** 2.0)
+        loss = torch.mean(torch.sum(squared_distance, dim=-1))
         return loss
     
+class loss_combined(nn.Module):
+    def __init__(self):
+        super(loss_combined, self).__init__()
+
+    def forward(self, batch, particle_list, particle_prob_list, state_step_sizes):
+        batch_q_r = batch['q_r'][:, :, None, :] # shape [batch_size, seq_len, 1, 2] = [20, 100, 1, 2]
+        
+        # distances has shape [batch_size, seq_len, num_particles]
+        # particle_list has shape [batch_size, seq_len, num_particles, state_dim]
+        x_distance = (batch_q_r[:, :, :, 0] - particle_list[:, :, :, 0])
+        y_distance = (batch_q_r[:, :, :, 1] - particle_list[:, :, :, 1])
+        squared_distance = (x_distance ** 2.0) + (y_distance ** 2.0)
+        # threshold = 0.067**2.0 + 0.14**2.0
+        # squared_distance[squared_distance < threshold] = 0 # boolean masking
+        loss_dist = torch.mean(torch.sum(squared_distance, dim=-1))
+
+        std = 0.01
+        particle_std = 0.05
+        sq_distance = compute_sq_distance(particle_list, batch['q_o'], state_step_sizes) # shape: [batch_size, seq_len, num_particles]
+        std_tensor = torch.tensor(2.0 * np.pi * (std ** 2.0))
+        activations = particle_prob_list / torch.sqrt(std_tensor) * torch.exp(-sq_distance / (2.0 * particle_std ** 2.0)) # shape: [batch_size, seq_len, num_particles]
+        loss_prob = torch.mean(-torch.log(1e-16 + torch.sum(activations, dim=-1)))
+
+        # print(loss_dist)
+        # print(loss_prob)
+
+        w1= 1.0
+        w2 = 0.4
+        loss = (w1 * loss_dist) + (w2 * loss_prob)
+
+        return loss
+    
+# like loss function B but uses object pose instead of robot pose
+class loss_fn_dist_to_robot_C(nn.Module):
+    def __init__(self):
+        super(loss_fn_dist_to_robot_C, self).__init__()
+
+    def forward(self, batch, particle_list, particle_prob_list, state_step_sizes):
+        batch_q_o = batch['q_o'][:, :, None, :] # shape [batch_size, 1, 1, 2] = [20, 1, 1, 2]
+        
+        # distances has shape [batch_size, seq_len, num_particles]
+        # particle_list has shape [batch_size, seq_len, num_particles, state_dim]
+        x_distance = (batch_q_o[:, :, :, 0] - particle_list[:, :, :, 0])
+        y_distance = (batch_q_o[:, :, :, 1] - particle_list[:, :, :, 1])
+        squared_distance = (x_distance ** 2.0) + (y_distance ** 2.0)
+        loss = torch.mean(torch.sum(squared_distance, dim=-1))
+        return loss
