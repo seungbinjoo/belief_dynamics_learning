@@ -1,5 +1,7 @@
 import numpy as np
 import math
+import torch
+import torch.nn as nn
 
 # take raw data and make a dictionary which holds all the data
 def organise_data(raw_data, num_sequences, num_steps_per_sequence):
@@ -102,19 +104,27 @@ def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes):
     # add dimension to tensor containing batch of object poses
     batch_q_o = batch_q_o[:, :, None, :]
     assert batch_q_o.shape == (batch_size, seq_len, 1, state_dim)
+    
+    # debugging - try normalising?
+    # batch_q_o = torch.nn.functional.normalize(batch_q_o, p=2.0, dim=-1)
+    # print(batch_q_o)
 
     # compute squared distance
     result = 0.0
-    for i in range(state_dim-1):
+    ranges = [0.1, 0.1, 1]
+    for i in range(state_dim):
         # compute difference
-        diff = particle_list[..., i] - batch_q_o[..., i]
+        diff = particle_list[..., i] - batch_q_o[..., i] # 'diff' has shape [batch_size, seq_len, num_particles] --> note: '...' represents as many ':' as needed to cover all the dimensions
+        print('diff:', diff[0, 0, :10])
         # wrap angle for theta
         if i == 2:
             diff = wrap_angle(diff)
         # add up scaled squared distance
-        result += (diff / q_r_step_sizes[i]) ** 2
+        # result += (diff / q_r_step_sizes[i]) ** 2
+        result += (diff/ranges[i]) ** 2
+        # result += (diff) ** 2
     return result
 
-# method for keeping angles between 0 and 2*pi
+# method for keeping angles between -pi and pi
 def wrap_angle(angle):
-    return ((angle - np.pi) % (2 * np.pi))
+    return ((angle - np.pi) % (2 * np.pi)) - np.pi
