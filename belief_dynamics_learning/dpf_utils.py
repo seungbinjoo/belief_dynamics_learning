@@ -2,9 +2,10 @@ import numpy as np
 import math
 import torch
 import torch.nn as nn
+from belief_dynamics_learning.world2d import *
 
 # take raw data and make a dictionary which holds all the data
-def organise_data(raw_data, num_sequences, num_steps_per_sequence):
+def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=False, xy_only=False):
     
     # initialise dictionary values
     q_o = np.zeros((num_sequences, 1, 3), dtype=float) # object pose
@@ -41,7 +42,55 @@ def organise_data(raw_data, num_sequences, num_steps_per_sequence):
     num_timesteps = data['a'].shape[1]
     data['a'][:, 1:, :] = data['a'][:, :num_timesteps-1, :]
 
+    # if we desire trajectories with only contacts, for q_r, o, a, only take data from the single index with contact
+    if contact_only == True:
+        
+        # find indices where observation is 1, i.e. where there is contact
+        # observations_squeezed = np.squeeze(data['o'])
+        # indices = np.where(observations_squeezed == 1)
+        # print(indices)
+        
+        data['q_r'] = np.expand_dims(data['q_r'][:, 1, :], axis=1)
+        data['o'] = np.expand_dims(data['o'][:, 1, :], axis=1)
+        data['a'] = np.expand_dims(data['a'][:, 1, :], axis=1)
+    
+    # get rid of angles from the dataset
+    if xy_only == True:
+        data['q_o'] = data['q_o'][:, :, :2]
+
     return data
+
+def check_errors_data(data, obj_dims, r_robot, xy_only):
+    """
+    Args:
+        'data' is a dictionary containing...
+        Object pose data: (500, 1, 3) or (500, 1, 2), depending on 'xy_only'
+        Robot pose data: (500, 1, 2)
+        Observation data: (500, 1, 1)
+        Action data: (500, 1, 2)
+    Returns:
+        errors_in_data: that is, the data but only the trajectories that have the error where the object intersects with the robot
+    """
+    q_r = torch.from_numpy(data['q_r']) # [num_sequences, 1, 2]
+    q_o = torch.from_numpy(data['q_o'][:, :, None, :]) # [num_sequences, 1, 1, state_dim]
+
+    # for all trajectories in data, calculate distance between gt object and robot
+    d = dist_to_object_torch(q_r, q_o, obj_dims, r_robot, xy_only) # [num_sequences, seq_len, num_particles] = [500, 1, 1]
+    d = torch.squeeze(d) # [500]
+
+    # select indices where distance is less than zero --> hence there is intersection
+    error_indices = torch.where(d < 0)[0]
+
+    if error_indices.shape[0] < 1:
+        print('No errors (intersections between robot and object) found in the dataset.')
+        return
+    else:
+        data_errors_only = {'q_o': data['q_o'][error_indices, :, :],
+                            'q_r': data['q_r'][error_indices, :, :],
+                            'o': data['o'][error_indices, :, :],
+                            'a': data['a'][error_indices, :, :]}
+
+        return data_errors_only
 
 # split data into training / validation set according to split_ratio
 def split_data(data, split_ratio):
@@ -93,17 +142,29 @@ def compute_statistics(data):
     return means, stds, q_o_maxs, q_o_mins, q_r_step_sizes, q_r_maxs, q_r_mins
 
 # compute squared distance between particle list and the object poses in the batch --> note: scale each dimension by dividing by the step sizes (for a sensible metric across state dimensions)
-def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes):
+def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes, xy_only):
     
     # compute some parameters
     batch_size = batch_q_o.shape[0]
     seq_len = batch_q_o.shape[1]
     num_particles = particle_list.shape[2]
-    state_dim = particle_list.shape[-1]
+    state_dim = batch_q_o.shape[-1]
+
+    if xy_only == True:
+        assert state_dim == 2
     
     # add dimension to tensor containing batch of object poses
     batch_q_o = batch_q_o[:, :, None, :]
+    # print(batch_q_o.shape)
     assert batch_q_o.shape == (batch_size, seq_len, 1, state_dim)
+    
+    # EXPERIMENT: use cos and sin as states for angles, instead of theta
+    # batch_q_o = torch.cat((
+    #     batch_q_o[:, :, :, 0:1],
+    #     batch_q_o[:, :, :, 1:2],
+    #     torch.cos(batch_q_o[:, :, :, 2:3]),
+    #     torch.sin(batch_q_o[:, :, :, 2:3])),
+    #     dim=-1)
     
     # debugging - try normalising?
     # batch_q_o = torch.nn.functional.normalize(batch_q_o, p=2.0, dim=-1)
@@ -111,19 +172,84 @@ def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes):
 
     # compute squared distance
     result = 0.0
-    ranges = [0.1, 0.1, 1]
+    # result = torch.zeros(batch_size, seq_len, num_particles, state_dim)
+
+    # scalings = [0.1, 0.1, 3]
+    scalings = [0.1, 0.1, 1]
+    # scalings = [1, 1, 1]
+    # scalings = [1, 1, 6.28]
+    # scalings = [1, 1, 5, 5] # EXPERIMENT: use cos and sin as states for angles, instead of theta
     for i in range(state_dim):
         # compute difference
+        # print(particle_list[0, 0, :10, 1])
         diff = particle_list[..., i] - batch_q_o[..., i] # 'diff' has shape [batch_size, seq_len, num_particles] --> note: '...' represents as many ':' as needed to cover all the dimensions
-        print('diff:', diff[0, 0, :10])
+        # print('diff:', diff[0, 0, :10]/scalings[i])
+        
         # wrap angle for theta
         if i == 2:
             diff = wrap_angle(diff)
+            # print('diff theta:', diff/scalings[i])
+        # else:
+        #     print('diff xy:', diff/scalings[i])
         # add up scaled squared distance
         # result += (diff / q_r_step_sizes[i]) ** 2
-        result += (diff/ranges[i]) ** 2
-        # result += (diff) ** 2
+        result += (diff/scalings[i]) ** 2
+        # result[:, :, :, i] = (diff/scalings[i]) ** 2
+        # print('result:', result.shape)
     return result
+
+def compute_sq_distance_other(batch_q_o, num_states_other, buffer):
+    """
+    Args:
+        batch_q_o: [batch_size, 1, state_dim]
+        num_states_other: []
+        buffer: []
+    Returns:
+        sq_distance_other: [batch_size, seq_len, num_states_other, num_states_other, num_states_other]
+    """
+    # x, y, theta should have shapes [batch_size, 1, num_states_other]
+    x_ratio = (batch_q_o[:, :, 0] - (-0.5)) / (0.5 - (-0.5))
+    num_states_other_left = torch.floor(num_states_other * x_ratio) # [batch_size, 1]
+    num_states_other_right = num_states_other - num_states_other_left # [batch_size, 1]
+
+    x = torch.zeros(batch_q_o.shape[0], batch_q_o.shape[1], num_states_other)
+    for i in range(batch_q_o.shape[0]):
+        x_left = torch.linspace(-0.5, batch_q_o[i, 0, 0].item() - buffer, int(num_states_other_left[i, 0].item()))
+        x_right = torch.linspace(batch_q_o[i, 0, 0].item() + buffer, 0.5, int(num_states_other_right[i, 0].item()))
+        x[i, 0, :] = torch.cat((x_left, x_right))
+
+    y_ratio = (batch_q_o[:, :, 1] - (0.5)) / (1.5 - (0.5))
+    num_states_other_left = torch.floor(num_states_other * y_ratio) # [batch_size, 1]
+    num_states_other_right = num_states_other - num_states_other_left # [batch_size, 1]
+
+    y = torch.zeros(batch_q_o.shape[0], batch_q_o.shape[1], num_states_other)
+    for i in range(batch_q_o.shape[0]):
+        y_left = torch.linspace(0.5, batch_q_o[i, 0, 1].item() - buffer, int(num_states_other_left[i, 0].item()))
+        y_right = torch.linspace(batch_q_o[i, 0, 1].item() + buffer, 1.5, int(num_states_other_right[i, 0].item()))
+        y[i, 0, :] = torch.cat((y_left, y_right))
+
+    scalings = [1, 1]
+    diff_x = (x - batch_q_o[:, :, 0:1]) / scalings[0] # [batch_size, 1, num_states_other]
+    diff_y = (y - batch_q_o[:, :, 1:2]) / scalings[1] # [batch_size, 1, num_states_other]
+    # diff_theta = (theta - batch_q_o[:, :, 2:3]) / scalings[2] # [batch_size, 1, num_states_other]
+
+    result_x = diff_x ** 2.0 # [batch_size, 1, num_states_other]
+    result_y = diff_y ** 2.0 # [batch_size, 1, num_states_other]
+    # result_theta = diff_theta ** 2.0 # [batch_size, 1, num_states_other]
+
+    sq_distance_other = torch.zeros(batch_q_o.shape[0], batch_q_o.shape[1], num_states_other, num_states_other)
+    # sq_distance_other = torch.zeros(batch_q_o.shape[0], batch_q_o.shape[1], num_states_other, num_states_other, num_states_other)
+
+    # for i in range(num_states_other):
+    #     for j in range(num_states_other):
+    #         for k in range(num_states_other):
+    #             sq_distance_other[:, :, i, j, k] = result_x[:, :, i] + result_y[:, :, j] + result_theta[:, :, k]
+
+    for i in range(num_states_other):
+        for j in range(num_states_other):
+            sq_distance_other[:, :, i, j] = result_x[:, :, i] + result_y[:, :, j]
+
+    return sq_distance_other
 
 # method for keeping angles between -pi and pi
 def wrap_angle(angle):
