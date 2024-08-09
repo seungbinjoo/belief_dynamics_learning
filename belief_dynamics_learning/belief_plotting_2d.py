@@ -30,7 +30,7 @@ def plot_object(ax, qo, dim_object, color='blue', alpha=1., zorder=None):
 def plot_object_belief(ax, bo, w, dim_obj, color='red', alpha_factor=10):
     # b: list of [x, y, theta]
     # num particles with w < 1e-3
-    print(np.sum(w < 1e-4))
+    # print(np.sum(w < 1e-4))
     for qo, wo in zip(bo, w):
         if wo < 1e-4: 
             alpha = 0.2
@@ -42,3 +42,9 @@ def plot_object_belief(ax, bo, w, dim_obj, color='red', alpha_factor=10):
             alpha = np.max([0.1, alpha])
             # alpha=0.3
         plot_object(ax, qo, dim_obj, color=color, alpha=alpha)
+
+def plot_observation(ax, q_r_desired, q_r_achieved):
+    # Plot the points
+    ax.plot(q_r_desired[0], q_r_desired[1], 'o', label='desired robot position', zorder=10, color='green')
+    ax.plot(q_r_achieved[0], q_r_achieved[1], 'o', label='achieved robot position', zorder=10, color='green')
+    ax.arrow(q_r_desired[0], q_r_desired[1], q_r_achieved[0] - q_r_desired[0], q_r_achieved[1] - q_r_desired[1], head_width=0.02, head_length=0.01, fc='magenta', ec='magenta', zorder=10)
