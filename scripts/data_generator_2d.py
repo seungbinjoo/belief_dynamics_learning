@@ -44,6 +44,59 @@ def generate_dataset(world, num_sequences, num_steps_per_sequence):
         data.append((world.qo_gt, q_r_hist, o_hist, a_hist))
     return data
 
+# data generator that creates trajectories which are dense with observations (contact events)
+def generate_dataset_dense(world, num_sequences, num_steps_per_sequence):
+    data = []
+    for i in tqdm.tqdm(range(num_sequences)):
+
+        observation_count = 0
+        # perform rollouts of length = seq_len, until a trajectory with 3 or more observations is found
+        while observation_count < 3:
+            # sample a new ground truth pose 
+            world.sample_gt_object_pose()
+            # sample a new robot pose
+            world.sample_robot_pose()
+            # check for initial contact, resample robot pose if in contact
+            d, _ = dist_to_object(world.q_r_0, world.qo_gt, world.obj_dims, world.r_robot)
+            while d < 0: 
+                world.sample_robot_pose()
+                d, _ = dist_to_object(world.q_r_0, world.qo_gt, world.obj_dims, world.r_robot)
+            # sample a sequence of (s,a,o) tuples
+            q_r_hist, o_hist, a_hist = world.rollout(num_steps_per_sequence, world.qo_gt.copy())
+            observation_count = np.sum(o_hist)
+
+        data.append((world.qo_gt, q_r_hist, o_hist, a_hist))
+    return data
+
+# data generator that creates trajectories of length 2, with 1 observation --> we ensure that the observation is not at the first time step
+def generate_dataset_contact_only(world, num_sequences, num_steps_per_sequence=1):
+    data = []
+    for i in tqdm.tqdm(range(num_sequences)):
+
+        observation_count = 0
+        # perform rollouts of length 2, until a trajectory with 1 or more observations is found
+        while observation_count < 1:
+            # sample a new ground truth pose 
+            world.sample_gt_object_pose()
+            # sample a new robot pose
+            world.sample_robot_pose()
+            # check for initial contact, resample robot pose if in contact
+            d, _ = dist_to_object(world.q_r_0, world.qo_gt, world.obj_dims, world.r_robot)
+            while d < 0: 
+                world.sample_robot_pose()
+                d, _ = dist_to_object(world.q_r_0, world.qo_gt, world.obj_dims, world.r_robot)
+            # sample a sequence of (s,a,o) tuples
+            q_r_hist, o_hist, a_hist = world.rollout(num_steps_per_sequence, world.qo_gt.copy())
+            observation_count = np.sum(o_hist)
+
+            # if first time step has observation, skip
+            if o_hist[0] == 0:
+                continue
+
+        data.append((world.qo_gt, q_r_hist, o_hist, a_hist))
+
+    return data
+
 if __name__ == "__main__":
     num_particles = 100
     dt=0.1
@@ -58,8 +111,8 @@ if __name__ == "__main__":
     world = World2D(num_particles, qo_gt, dim_object, sigma_pos, 
                     qr_0, r_robot, dt)
     # generate a dataset
-    data = generate_dataset(world, 200, 100)
+    data = generate_dataset_contact_only(world, 500, 1)
     # save the dataset to a file
-    save_path = os.path.join(root, '../data/data.pkl')
+    save_path = os.path.join(root, '../data/data_min_1_contacts_seq_len_2_test_500_trajectories.pkl')
     with open(save_path, 'wb') as f: 
         pickle.dump(data, f)
