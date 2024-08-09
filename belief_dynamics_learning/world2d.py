@@ -62,65 +62,37 @@ def dist_to_object_batch(q_r, q_o, dim_object, r_robot):
     d = np.linalg.norm(q_r_o - q_r_o_clipped, axis=1) - r_robot # [N]
     return d
 
-def dist_to_object_torch(q_r, q_o, dim_object, r_robot):
+def dist_to_object_torch(q_r, particle_list, dim_object, r_robot, xy_only):
     """
-    Compute the shortest distance between the robot and the object.
+    Using PyTorch, compute the shortest distance between the robot and the object
     Args:
-        q_r: robot pose [3] (tensor)
-        q_o: object pose [3] (tensor)
-        dim_object: object dimensions [2] (tensor) - assuming rectangle
-        r_robot: robot radius (scalar)
+        q_r: [batch_size, seq_len, 2]
+        particle_list: [batch_size, seq_len, num_particles, state_dim]
     Returns:   
         d: shortest distance (tensor)
-        closest_point: closest point on the object to the robot 
-                       (in the robot frame) (tensor)
     """
-    # print('robot pose:', q_r)
-    # print('proposed particle = predicted object pose:', q_o)
-    # Compute robot position in object frame
-    sin_o = torch.sin(q_o[2])
-    cos_o = torch.cos(q_o[2])
-    R = torch.tensor([[cos_o, sin_o], [-sin_o, cos_o]])
-    q_r_o = torch.matmul(R, (q_r[:2] - q_o[:2]))
-    
-    # Clip robot to rectangle
-    q_r_o_clipped = torch.clamp(q_r_o, torch.from_numpy(-dim_object/2), torch.from_numpy(dim_object/2))
-    
-    # Compute distance
-    d = torch.norm(q_r_o - q_r_o_clipped) - r_robot
-    # print('distance:', d)
-    
-    # Convert the closest point back to the robot frame
-    # R_inv = torch.linalg.inv(R)
-    # closest_point = torch.matmul(R_inv, q_r_o_clipped) + q_o[:2]
-    
-    # return d, closest_point
-    return d
+    if xy_only == True:
+        zero_angles = torch.zeros(particle_list.shape[0], particle_list.shape[1], particle_list.shape[2], 1)
+        particle_list = torch.cat((particle_list, zero_angles), dim=-1)
 
-def dist_to_object_batch_torch(q_r, q_o, dim_object, r_robot):
-    """
-    Compute the shortest distance between the robot and the object in batch. 
-    Args: 
-        q_r: robot pose [3] (tensor)
-        q_o: object poses [N, 3] (tensor)
-        dim_object: object dimensions [2] (tensor)
-        r_robot: robot radius (scalar)
-    Returns:
-        d: shortest distances for each possible object pose to 
-           given robot pose [N] (tensor)
-    """
-    # Compute robot position in object frame
-    sin_o = torch.sin(q_o[:, 2])
-    cos_o = torch.cos(q_o[:, 2])
-    R = torch.stack([torch.stack([cos_o, sin_o], dim=1), torch.stack([-sin_o, cos_o], dim=1)], dim=1)  # [N, 2, 2]
-    q_r_o = torch.einsum('nij,nj->ni', R, q_r[:2] - q_o[:, :2])  # [N, 2]
-    
-    # Clip robot to rectangle
-    q_r_o_clipped = torch.clamp(q_r_o, -dim_object / 2, dim_object / 2)  # [N, 2]
-    
-    # Compute distance
-    d = torch.norm(q_r_o - q_r_o_clipped, dim=1) - r_robot  # [N]
-    
+    q_r = q_r[:, :, None, :] # [batch_size, seq_len, 1, 2]
+    q_r_o = q_r - particle_list[:, :, :, :2] # [batch_size, seq_len, num_particles, 2]
+
+    theta = particle_list[:, :, :, 2] # [batch_size, seq_len, num_particles]
+    cos_theta = torch.cos(theta) # [batch_size, seq_len, num_particles]
+    sin_theta = torch.sin(theta) # [batch_size, seq_len, num_particles]
+    R = torch.stack((torch.stack((cos_theta, sin_theta), dim=-1), torch.stack((-sin_theta, cos_theta), dim=-1)), dim=-1) # [batch_size, seq_len, num_particle, 2, 2]
+
+    # first, add an extra dimension to q_r_o to make it compatible for matrix multiplication
+    q_r_o_expanded = q_r_o.unsqueeze(-1)  # [batch_size, seq_len, num_particles, 2, 1]
+    # perform the matrix multiplication
+    q_r_o = torch.matmul(R, q_r_o_expanded)  # [batch_size, seq_len, num_particles, 2, 1]
+    # remove the last dimension to get back to shape [batch_size, seq_len, num_particles, 2]
+    q_r_o = q_r_o.squeeze(-1)
+
+    q_r_o_clipped = torch.clamp(q_r_o, torch.from_numpy(-dim_object/2), torch.from_numpy(dim_object/2))
+    d = torch.linalg.norm(q_r_o - q_r_o_clipped, ord=2, dim=-1) - r_robot # [batch_size, seq_len, num_particles]
+
     return d
 
 class World2D:
@@ -190,6 +162,17 @@ class World2D:
         plot_robot(ax, self.q_r_0, self.r_robot, color=robot_color)
         plot_object(ax, self.qo_gt, self.obj_dims, color=gt_color)
         plot_object_belief(ax, self.particles, self.weights, self.obj_dims)
+        plt.show()
+
+    def plot_belief_with_obs(self, q_r_desired, q_r_achieved):
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
+        ax.set_aspect('equal')
+        ax.set_xlim(self.bounds[0])
+        ax.set_ylim(self.bounds[1])
+        plot_robot(ax, self.q_r_0, self.r_robot, color=robot_color)
+        plot_object(ax, self.qo_gt, self.obj_dims, color=gt_color)
+        plot_object_belief(ax, self.particles, self.weights, self.obj_dims)
+        plot_observation(ax, q_r_desired, q_r_achieved)
         plt.show()
     
     def plot_rollout(self, q_r_hist, o_hist):
