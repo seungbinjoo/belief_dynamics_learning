@@ -60,6 +60,61 @@ def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=
 
     return data
 
+# take raw data with phi observations and make a dictionary which holds all the data
+def organise_data_phi(raw_data, num_sequences, num_steps_per_sequence, contact_only=True, xy_only=False):
+
+    # initialise dictionary values
+    q_o = np.zeros((num_sequences, 1, 3), dtype=float) # object pose
+    q_r = np.zeros((num_sequences, num_steps_per_sequence, 2), dtype=float) # robot pose
+    q_o_r = np.zeros((num_sequences, num_steps_per_sequence, 2), dtype=float) # object pose in robot frame
+    phi = np.zeros((num_sequences, num_steps_per_sequence, 1), dtype=float) # phi observation
+    cp = np.zeros((num_sequences, num_steps_per_sequence, 2), dtype=float) # closest point
+
+    data = {'q_o': q_o,
+            'q_r': q_r,
+            'q_o_r': q_o_r,
+            'phi': phi,
+            'cp': cp}
+    
+    # store contents of raw data file into q_o, q_r, phi
+    for i, trajectory in enumerate(raw_data):
+        q_o_traj, q_r_traj, phi_traj, cp_traj = trajectory
+        
+        # store object pose for all trajectories
+        q_o_traj = np.expand_dims(q_o_traj, axis=(0, 1))
+        data['q_o'][i, :, :] = q_o_traj
+
+        # store robot pose histories for all trajectories
+        q_r_traj = np.expand_dims(q_r_traj[:num_steps_per_sequence, :], axis=0)
+        data['q_r'][i, :, :] = q_r_traj
+
+        # store object pose in robot frame for all trajectories
+        data['q_o_r'] = data['q_o'][:, :, :2] - data['q_r']
+
+        # store observation histories for all trajectories
+        # phi_traj has shape () --> scalar np array
+        phi_traj = np.expand_dims(phi_traj, axis=(1))
+        data['phi'][i, :, :] = phi_traj
+
+        # store closest point data --> won't be used in training though
+        cp_traj = np.expand_dims(cp_traj, axis=())
+        data['cp'][i, :, :] = cp_traj
+
+    # if we desire trajectories with only contacts, for q_r, o, a, only take data from the single index with contact
+    # if contact_only == True:
+    #     data['q_r'] = np.expand_dims(data['q_r'][:, 1, :], axis=1)
+    #     data['q_o_r'] = np.expand_dims(data['q_o_r'][:, 1, :], axis=1)
+    
+    # get rid of angles from the dataset
+    if xy_only == True:
+        data['q_o'] = data['q_o'][:, :, :2]
+
+    return data
+
+def noisify_data(data):
+    data = data
+    return data
+
 def check_errors_data(data, obj_dims, r_robot, xy_only):
     """
     Args:
@@ -96,7 +151,7 @@ def check_errors_data(data, obj_dims, r_robot, xy_only):
 def split_data(data, split_ratio):
     
     # keys for dictionary which contains data
-    keys = ['q_o', 'q_r', 'o', 'a']
+    keys = ['q_o', 'q_r', 'q_o_r', 'phi', 'cp']
 
     # number of trajectories in the data
     num_trajectories = data['q_o'].shape[0]
@@ -107,17 +162,20 @@ def split_data(data, split_ratio):
     return train_data, val_data
 
 # compute some statistics of the training data
-def compute_statistics(data):
+def compute_statistics(data, phi_dataset):
     
     means = dict()
     stds = dict()
-    q_o_maxs = []
-    q_o_mins = []
+    q_o_r_maxs = []
+    q_o_r_mins = []
     q_r_step_sizes = []
     q_r_maxs = []
     q_r_mins = []
 
-    keys = ['q_o', 'q_r', 'o', 'a']
+    if phi_dataset == False:
+        keys = ['q_o', 'q_r', 'o', 'a']
+    else:
+        keys = ['q_o', 'q_r', 'phi', 'q_o_r', 'cp']
 
     for key in keys:
         # compute means
@@ -127,8 +185,8 @@ def compute_statistics(data):
         stds[key] = np.std(data[key], axis=(0, 1))
 
     # compute object pose maximums
-    q_o_maxs = np.max(data['q_o'], axis=(0, 1))
-    q_o_mins = np.min(data['q_o'], axis=(0, 1))
+    q_o_r_maxs = np.max(data['q_o_r'], axis=(0, 1))
+    q_o_r_mins = np.min(data['q_o_r'], axis=(0, 1))
 
     # compute robot pose maximums
     q_r_maxs = np.max(data['q_r'], axis=(0, 1))
@@ -139,7 +197,7 @@ def compute_statistics(data):
         steps = np.reshape(data['q_r'][:, 1:, i] - data['q_r'][:, :-1, i], [-1])
         q_r_step_sizes.append(np.mean(abs(steps)))
 
-    return means, stds, q_o_maxs, q_o_mins, q_r_step_sizes, q_r_maxs, q_r_mins
+    return means, stds, q_o_r_maxs, q_o_r_mins, q_r_step_sizes, q_r_maxs, q_r_mins
 
 # compute squared distance between particle list and the object poses in the batch --> note: scale each dimension by dividing by the step sizes (for a sensible metric across state dimensions)
 def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes, xy_only):
@@ -175,7 +233,7 @@ def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes, xy_only):
     # result = torch.zeros(batch_size, seq_len, num_particles, state_dim)
 
     # scalings = [0.1, 0.1, 3]
-    scalings = [0.1, 0.1, 1]
+    scalings = [1, 1, 10]
     # scalings = [1, 1, 1]
     # scalings = [1, 1, 6.28]
     # scalings = [1, 1, 5, 5] # EXPERIMENT: use cos and sin as states for angles, instead of theta
@@ -188,9 +246,9 @@ def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes, xy_only):
         # wrap angle for theta
         if i == 2:
             diff = wrap_angle(diff)
-            # print('diff theta:', diff/scalings[i])
-        # else:
-        #     print('diff xy:', diff/scalings[i])
+            print('diff theta:', diff/scalings[i])
+        else:
+            print('diff xy:', diff/scalings[i])
         # add up scaled squared distance
         # result += (diff / q_r_step_sizes[i]) ** 2
         result += (diff/scalings[i]) ** 2
@@ -254,3 +312,32 @@ def compute_sq_distance_other(batch_q_o, num_states_other, buffer):
 # method for keeping angles between -pi and pi
 def wrap_angle(angle):
     return ((angle - np.pi) % (2 * np.pi)) - np.pi
+
+# angle between two vectors --> between -pi and pi
+def angle_between_vectors(u, v):
+    # convert inputs to numpy arrays
+    u = np.array(u)
+    v = np.array(v)
+    
+    # calculate the dot product
+    dot_product = np.dot(u, v)
+    
+    # calculate the magnitudes of the vectors
+    norm_u = np.linalg.norm(u)
+    norm_v = np.linalg.norm(v)
+    
+    # compute the angle in radians between 0 and pi
+    cos_theta = dot_product / (norm_u * norm_v)
+    angle_rad = np.arccos(np.clip(cos_theta, -1.0, 1.0))
+    
+    # calculate the 2D cross product (equivalent to the z-component of the 3D cross product)
+    cross_product_z = u[0] * v[1] - u[1] * v[0]
+    
+    # determine the sign of the angle
+    if cross_product_z < 0:
+        angle_rad = -angle_rad
+    
+    # convert angle to degrees
+    angle_deg = np.degrees(angle_rad)
+    
+    return angle_rad, angle_deg
