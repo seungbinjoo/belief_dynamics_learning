@@ -5,63 +5,7 @@ import torch.nn as nn
 from belief_dynamics_learning.world2d import *
 
 # take raw data and make a dictionary which holds all the data
-def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=False, xy_only=False):
-    
-    # initialise dictionary values
-    q_o = np.zeros((num_sequences, 1, 3), dtype=float) # object pose
-    q_r = np.zeros((num_sequences, num_steps_per_sequence, 2), dtype=float) # robot pose
-    o = np.zeros((num_sequences, num_steps_per_sequence, 1), dtype=float) # observation
-    a = np.zeros((num_sequences, num_steps_per_sequence, 2), dtype=float) # action
-
-    data = {'q_o': q_o,
-            'q_r': q_r,
-            'o': o,
-            'a': a}
-
-    # store contents of raw data file into q_r, o, a
-    for i, trajectory in enumerate(raw_data):
-        q_o_traj, q_r_traj, o_traj, a_traj = trajectory
-        
-        # store object pose for all trajectories
-        q_o_traj = np.expand_dims(q_o_traj, axis=(0, 1))
-        data['q_o'][i, :, :] = q_o_traj
-
-        # store robot pose histories for all trajectories
-        q_r_traj = np.expand_dims(q_r_traj[:num_steps_per_sequence, :], axis=0)
-        data['q_r'][i, :, :] = q_r_traj
-
-        # store observation histories for all trajectories
-        o_traj = np.expand_dims(o_traj[:num_steps_per_sequence], axis=(0,2))
-        data['o'][i, :, :] = o_traj
-
-        # store action histories for all trajectories
-        a_traj = np.expand_dims(a_traj, axis=0)
-        data['a'][i, :, :] = a_traj
-
-    # modify actions such that 'a' represents the current desired robot position --> shift every element in 'a' forward by one timestep
-    num_timesteps = data['a'].shape[1]
-    data['a'][:, 1:, :] = data['a'][:, :num_timesteps-1, :]
-
-    # if we desire trajectories with only contacts, for q_r, o, a, only take data from the single index with contact
-    if contact_only == True:
-        
-        # find indices where observation is 1, i.e. where there is contact
-        # observations_squeezed = np.squeeze(data['o'])
-        # indices = np.where(observations_squeezed == 1)
-        # print(indices)
-        
-        data['q_r'] = np.expand_dims(data['q_r'][:, 1, :], axis=1)
-        data['o'] = np.expand_dims(data['o'][:, 1, :], axis=1)
-        data['a'] = np.expand_dims(data['a'][:, 1, :], axis=1)
-    
-    # get rid of angles from the dataset
-    if xy_only == True:
-        data['q_o'] = data['q_o'][:, :, :2]
-
-    return data
-
-# take raw data with phi observations and make a dictionary which holds all the data
-def organise_data_phi(raw_data, num_sequences, num_steps_per_sequence, contact_only=True, xy_only=False):
+def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=True, xy_only=False):
 
     # initialise dictionary values
     q_o = np.zeros((num_sequences, 1, 3), dtype=float) # object pose
@@ -81,31 +25,27 @@ def organise_data_phi(raw_data, num_sequences, num_steps_per_sequence, contact_o
         q_o_traj, q_r_traj, phi_traj, cp_traj = trajectory
         
         # store object pose for all trajectories
-        q_o_traj = np.expand_dims(q_o_traj, axis=(0, 1))
-        data['q_o'][i, :, :] = q_o_traj
+        data['q_o'][i, :, :] = q_o_traj[None, :]
 
         # store robot pose histories for all trajectories
-        q_r_traj = np.expand_dims(q_r_traj[:num_steps_per_sequence, :], axis=0)
         data['q_r'][i, :, :] = q_r_traj
 
         # store object pose in robot frame for all trajectories
         data['q_o_r'] = data['q_o'][:, :, :2] - data['q_r']
 
         # store observation histories for all trajectories
-        # phi_traj has shape () --> scalar np array
-        phi_traj = np.expand_dims(phi_traj, axis=(1))
-        data['phi'][i, :, :] = phi_traj
+        # note: initially, phi_traj has shape () --> scalar np array
+        data['phi'][i, :, :] = phi_traj[None, None]
 
         # store closest point data --> won't be used in training though
-        cp_traj = np.expand_dims(cp_traj, axis=())
-        data['cp'][i, :, :] = cp_traj
+        data['cp'][i, :, :] = cp_traj[None, :]
 
-    # if we desire trajectories with only contacts, for q_r, o, a, only take data from the single index with contact
+    # # if we desire trajectories with only contacts, for q_r, o, a, only take data from the single index with contact
     # if contact_only == True:
     #     data['q_r'] = np.expand_dims(data['q_r'][:, 1, :], axis=1)
     #     data['q_o_r'] = np.expand_dims(data['q_o_r'][:, 1, :], axis=1)
     
-    # get rid of angles from the dataset
+    # if we only want xy states, get rid of angles from the dataset
     if xy_only == True:
         data['q_o'] = data['q_o'][:, :, :2]
 
@@ -213,47 +153,26 @@ def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes, xy_only):
     
     # add dimension to tensor containing batch of object poses
     batch_q_o = batch_q_o[:, :, None, :]
-    # print(batch_q_o.shape)
     assert batch_q_o.shape == (batch_size, seq_len, 1, state_dim)
-    
-    # EXPERIMENT: use cos and sin as states for angles, instead of theta
-    # batch_q_o = torch.cat((
-    #     batch_q_o[:, :, :, 0:1],
-    #     batch_q_o[:, :, :, 1:2],
-    #     torch.cos(batch_q_o[:, :, :, 2:3]),
-    #     torch.sin(batch_q_o[:, :, :, 2:3])),
-    #     dim=-1)
-    
-    # debugging - try normalising?
-    # batch_q_o = torch.nn.functional.normalize(batch_q_o, p=2.0, dim=-1)
-    # print(batch_q_o)
+
+    result = 0.0
+    scalings = [1, 1, 10]
 
     # compute squared distance
-    result = 0.0
-    # result = torch.zeros(batch_size, seq_len, num_particles, state_dim)
-
-    # scalings = [0.1, 0.1, 3]
-    scalings = [1, 1, 10]
-    # scalings = [1, 1, 1]
-    # scalings = [1, 1, 6.28]
-    # scalings = [1, 1, 5, 5] # EXPERIMENT: use cos and sin as states for angles, instead of theta
     for i in range(state_dim):
         # compute difference
-        # print(particle_list[0, 0, :10, 1])
         diff = particle_list[..., i] - batch_q_o[..., i] # 'diff' has shape [batch_size, seq_len, num_particles] --> note: '...' represents as many ':' as needed to cover all the dimensions
-        # print('diff:', diff[0, 0, :10]/scalings[i])
-        
+
         # wrap angle for theta
         if i == 2:
             diff = wrap_angle(diff)
-            print('diff theta:', diff/scalings[i])
+            # print('diff theta:', diff/scalings[i])
         else:
-            print('diff xy:', diff/scalings[i])
+            # print('diff xy:', diff/scalings[i])
+            pass
+        
         # add up scaled squared distance
-        # result += (diff / q_r_step_sizes[i]) ** 2
         result += (diff/scalings[i]) ** 2
-        # result[:, :, :, i] = (diff/scalings[i]) ** 2
-        # print('result:', result.shape)
     return result
 
 def compute_sq_distance_other(batch_q_o, num_states_other, buffer):
