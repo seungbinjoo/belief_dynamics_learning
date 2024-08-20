@@ -10,7 +10,7 @@ from belief_dynamics_learning.dpf_utils import *
 
 class DPF():
 
-    def __init__(self, propose_ratio, proposer_keep_ratio, min_obs_likelihood, num_particles, world: World2D, xy_only=False):
+    def __init__(self, propose_ratio, proposer_keep_ratio, min_obs_likelihood, num_particles, world: World2D, xy_only=False, phi_dataset=True):
         """
         Apply differentiable particle filter (DPF) to current belief of the object pose (represented by particle set)
         to predict the belief at the next time step.
@@ -35,22 +35,25 @@ class DPF():
         self.num_particles = int(num_particles)
 
         # build learnable networks: observation likelihood estimator, particle proposer
-        self.build_networks(xy_only)
+        self.build_networks(xy_only, phi_dataset)
 
-    def build_networks(self, xy_only):
+        # OLE loss function
+        self.OLE_loss_fn = loss_OLE(self)
+
+    def build_networks(self, xy_only, phi_dataset):
         
         # device configuration --> use GPU if available
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   
         print('Using device:', self.device)
 
         # PARTICLE PROPOSER --> maps observations and robot poses to particles
-        self.particle_proposer = ParticleProposer(self.proposer_keep_ratio, xy_only).to(self.device)
+        self.particle_proposer = ParticleProposer(self.proposer_keep_ratio, xy_only, phi_dataset).to(self.device)
 
         # OBSERVATION LIKELIHOOD ESTIMATOR --> maps observations and robot poses to probabilities
         self.obs_like_estimator = ObsLikelihoodEstimator(self.min_obs_likelihood).to(self.device)
 
     # compute observation likelihood (probabilities) for a particle set
-    def measurement_update(self, q_r_desired, q_r_achieved, observation, particles, means, stds):
+    def measurement_update(self, phi, particles, means, stds):
         """
         For each particle in the particle-based belief, compute likelihood of the observation.
         Args:
@@ -61,18 +64,20 @@ class DPF():
         """
 
         # prepare input to the observation likelihood estimator network
-        q_r_desired = q_r_desired.float().to(self.device) # shape [batch_size, 2]
-        q_r_achieved = q_r_achieved.float().to(self.device) # shape [batch_size, 2]
-        observation = observation.float().to(self.device) # shape [batch_size, 1]
-        observation_input = torch.cat((q_r_desired, q_r_achieved, observation), dim=-1) # shape [batch_size, 5]
-        observation_input = torch.tile(observation_input[:, None, :], (1, particles.shape[1], 1)) # shape [batch_size, num_particles, 5]
+        # q_r_desired = q_r_desired.float().to(self.device) # shape [batch_size, 2]
+        # q_r_achieved = q_r_achieved.float().to(self.device) # shape [batch_size, 2]
+        phi = phi.float().to(self.device) # shape [batch_size, 1]
+
+        # observation_input = torch.cat((q_r_desired, q_r_achieved, observation), dim=-1) # shape [batch_size, 5]
+        observation_input = torch.tile(phi[:, None, :], (1, particles.shape[1], 1)) # shape [batch_size, num_particles, 1]
         particle_input = self.transform_particles_as_input(particles, means, stds) # shape [batch_size, num_particles, 4]
-        input = torch.cat((observation_input, particle_input), dim=-1) # shape [batch_size, num_particles, 9]
-        input = input.view(-1, input.shape[-1]).float().to(self.device) # shape [batch_size * num_particles, 9]
+
+        input = torch.cat((observation_input, particle_input), dim=-1) # shape [batch_size, num_particles, 5]
+        input = input.view(-1, input.shape[-1]).float().to(self.device) # shape [batch_size * num_particles, 5]
 
         # for each particle, estimate the likelihood based on the observation
         obs_likelihood = self.obs_like_estimator(input) # pass input particle set through the observaton likelihood estimator network
-        obs_likelihood = obs_likelihood.view(q_r_desired.shape[0], particles.shape[1])
+        obs_likelihood = obs_likelihood.view(phi.shape[0], particles.shape[1])
 
         return obs_likelihood # shape [batch_size, num_particles]
     
@@ -80,23 +85,23 @@ class DPF():
     def transform_particles_as_input(self, particles, means, stds):
         
         # ensure means and stds are torch tensors
-        means_q_o = torch.tensor(means['q_o'], device=self.device)
-        stds_q_o = torch.tensor(stds['q_o'], device=self.device)
+        means_q_o_r = torch.tensor(means['q_o_r'], device=self.device)
+        stds_q_o_r = torch.tensor(stds['q_o_r'], device=self.device)
 
         input = torch.cat((
-            (particles[:, :, :2] - means_q_o[None, None, :2]) / stds_q_o[None, None, :2],
+            (particles[:, :, :2] - means_q_o_r[None, None, :2]) / stds_q_o_r[None, None, :2],
             torch.cos(particles[:, :, 2:3]),
             torch.sin(particles[:, :, 2:3])),
             dim=-1)
 
         return input # should the angle state theta be divided into two states, cos and sin theta?
     
-    def propose_particles(self, q_r_desired, q_r_achieved, observation, num_particles, state_mins, state_maxs, xy_only):
+    def propose_particles(self, phi, num_particles, state_mins, state_maxs, xy_only):
         
         # achieved_minus_desired = q_r_achieved - q_r_desired
-        input_pp = torch.cat((q_r_desired, q_r_achieved), dim=-1) # shape [batch_size, 4]
-        duplicated_input_pp = torch.tile(input_pp[:, None, :], (1, num_particles, 1)) # duplicate the input 'num_particles' times so we generate multiple particles, shape [batch_size, num_particles, 4]
-        duplicated_input_pp = duplicated_input_pp.view(-1, 4).float().to(self.device) # shape [batch_size * num_particles, 4]
+        # input_pp = torch.cat((q_r_desired, q_r_achieved), dim=-1) # shape [batch_size, 4]
+        # duplicated_input_pp = torch.tile(input_pp[:, None, :], (1, num_particles, 1)) # duplicate the input 'num_particles' times so we generate multiple particles, shape [batch_size, num_particles, 4]
+        # duplicated_input_pp = duplicated_input_pp.view(-1, 4).float().to(self.device) # shape [batch_size * num_particles, 4]
         
         # normalise??
         # duplicated_input_pp = torch.nn.functional.normalize(duplicated_input_pp, p=2.0, dim=2)
@@ -107,9 +112,13 @@ class DPF():
             output_dim_pp = 4
         else:
             output_dim_pp = 2
+
+        input_pp = phi # [batch_size, 1]
+        duplicated_input_pp = torch.tile(input_pp[:, None, :], (1, num_particles, 1))
+        duplicated_input_pp = duplicated_input_pp.view(-1, 1).float().to(self.device) # shape [batch_size * num_particles, 1]
         
         proposed_particles = self.particle_proposer(duplicated_input_pp) # shape [batch_size * num_particles, output_dim_pp]
-        proposed_particles = proposed_particles.view(q_r_achieved.shape[0], num_particles, output_dim_pp) # shape [batch_size, num_particles, output_dim_pp]
+        proposed_particles = proposed_particles.view(phi.shape[0], num_particles, output_dim_pp) # shape [batch_size, num_particles, output_dim_pp]
         
         # outputs from particle proposer are between -1 and 1 --> scale according to state maximums and minimums
         if xy_only == False:
@@ -135,7 +144,7 @@ class DPF():
         return proposed_particles
     
     # for now training loop ignores resampling --> all the particles in the loop are from the particle proposer (no resampling from the previous particle set)
-    def fit(self, data, split_ratio, batch_size, seq_len, num_epochs, patience, learning_rate, num_particles, xy_only):
+    def fit(self, data, split_ratio, batch_size, seq_len, num_epochs, num_epochs_ole, learning_rate, num_particles, xy_only, phi_dataset):
         
         # split data into training and validation set
         train_data, val_data = split_data(data, split_ratio)
@@ -148,8 +157,9 @@ class DPF():
         val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
 
         # compute some statistics about training data
-        means, stds, q_o_maxs, q_o_mins, q_r_step_sizes, q_r_maxs, q_r_mins = compute_statistics(train_data)
+        means, stds, q_o_r_maxs, q_o_r_mins, q_r_step_sizes, q_r_maxs, q_r_mins = compute_statistics(train_data, phi_dataset)
 
+        # TRAINING THE PARTICLE PROPOSER
         # optimiser and loss
         # EXPERIMENT: disable ole network and just have the particle_prob_list be uniform probability every sequence
         # optimiser_e2e = torch.optim.Adam([
@@ -182,14 +192,16 @@ class DPF():
                 for t in range(seq_len):
                     batch_t = {'q_o': batch['q_o'][:, :, :],
                             'q_r': batch['q_r'][:, t, :],
-                            'o': batch['o'][:, t, :],
-                            'a': batch['a'][:, t, :]}
+                            'q_o_r': batch['q_o_r'][:, t, :],
+                            'phi': batch['phi'][:, t, :]}
+                            # 'a': batch['a'][:, t, :]}
 
                     # data for one timestep                
                     q_o = batch_t['q_o'].squeeze(1) # shape [batch_size, 3]
-                    q_r_desired = batch_t['a'].squeeze(1) # desired robot pose is action from previous time step --> shape [batch_size, 2]
+                    # q_r_desired = batch_t['a'].squeeze(1) # desired robot pose is action from previous time step --> shape [batch_size, 2]
                     q_r_achieved = batch_t['q_r'].squeeze(1) # shape [batch_size, 2]
-                    observation = batch_t['o'] # shape [batch_size, 1]
+                    q_o_r = batch_t['q_o_r'].squeeze(1) # shape [batch_size, 2]
+                    phi = batch_t['phi'] # shape [batch_size, 1]
 
                     # test print - for debugging
                     # print(q_o)
@@ -198,12 +210,14 @@ class DPF():
                     # print(observation)
                     
                     # propose particles
-                    proposed_particles = self.propose_particles(q_r_desired, q_r_achieved, observation, num_particles, q_o_mins, q_o_maxs, xy_only) # shape [batch_size, num_particles, 3]
+                    # proposed_particles = self.propose_particles(q_r_desired, q_r_achieved, observation, num_particles, q_o_mins, q_o_maxs, xy_only) # shape [batch_size, num_particles, 3]
+                    proposed_particles = self.propose_particles(phi, num_particles, q_o_r_mins, q_o_r_maxs, xy_only) # shape [batch_size, num_particles, 3]
                     print(proposed_particles.shape)
                     particle_list[:, t, :, :] = proposed_particles
                     
                     # observation likelihood estimator network
-                    # particle_probs = self.measurement_update(q_r_desired, q_r_achieved, observation, proposed_particles, means, stds)
+                    # particle_probs = self.measurement_update(phi, proposed_particles, means, stds)
+                    # particle_probs = particle_probs / torch.sum(particle_probs) # normalise so that probabilities add up to 1
                     # particle_prob_list[:, t, :] = particle_probs
 
                 # EXPERIMENT: disable ole network and just have the particle_prob_list be uniform probability every sequence
@@ -227,7 +241,7 @@ class DPF():
 
         # plot training and validation loss
         epochs = range(1, num_epochs+1)
-        plt.plot(epochs, train_loss_list, label='Training loss')
+        plt.plot(epochs, train_loss_list, label='Training loss for particle proposer')
 
         # labels and axes
         plt.xlabel('Epochs')
@@ -236,7 +250,87 @@ class DPF():
         plt.legend()
 
         # return most recent batch of proposed particles
-        return q_o.detach().numpy(), particle_list.detach().numpy(), particle_prob_list.detach().numpy()
+        # return q_o.detach().numpy(), particle_list.detach().numpy(), particle_prob_list.detach().numpy()
+
+
+        # TRAINING THE OOBSERVATION LIKELIHOOD ESTIMATOR
+        optimiser_OLE = torch.optim.Adam(self.obs_like_estimator.parameters(), lr=learning_rate)
+        loss_fn = self.OLE_loss_fn
+
+        # initialise variables needed in the training loop
+        epoch = 0
+        train_loss_list_OLE = np.zeros((num_epochs_ole,))
+        
+        # training loop: go through epochs (number of epochs = 'num_epochs')
+        while epoch < num_epochs_ole:
+            # print the epoch number at the start of each epoch
+            print(f"Epoch {epoch+1}/{num_epochs_ole}")
+
+            # training loop: for each epoch, go through multiple batches --> e.g. q_o batch has dimensions [batch_size, seq_len, 3]
+            for i, batch in enumerate(train_dataloader):
+                # load to gpu 
+                batch = {k: v.float().to(self.device) for k, v in batch.items()}
+                # initialise matrix to store particles
+                particle_list = torch.zeros([batch_size, seq_len, num_particles, self.state_dim], 
+                                            dtype=torch.float64, device=self.device)
+                particle_prob_list = torch.zeros([batch_size, seq_len, num_particles], 
+                                                 dtype=torch.float64, device=self.device)
+
+                # for each time step
+                for t in range(seq_len):
+                    batch_t = {'q_o': batch['q_o'][:, :, :],
+                            'q_r': batch['q_r'][:, t, :],
+                            'q_o_r': batch['q_o_r'][:, t, :],
+                            'phi': batch['phi'][:, t, :]}
+                            # 'a': batch['a'][:, t, :]}
+
+                    # data for one timestep                
+                    q_o = batch_t['q_o'].squeeze(1) # shape [batch_size, 3]
+                    # q_r_desired = batch_t['a'].squeeze(1) # desired robot pose is action from previous time step --> shape [batch_size, 2]
+                    q_r_achieved = batch_t['q_r'].squeeze(1) # shape [batch_size, 2]
+                    q_o_r = batch_t['q_o_r'].squeeze(1) # shape [batch_size, 2]
+                    phi = batch_t['phi'] # shape [batch_size, 1]
+                    
+                    # propose particles
+                    # proposed_particles = self.propose_particles(q_r_desired, q_r_achieved, observation, num_particles, q_o_mins, q_o_maxs, xy_only) # shape [batch_size, num_particles, 3]
+                    proposed_particles = self.propose_particles(phi, num_particles, q_o_r_mins, q_o_r_maxs, xy_only) # shape [batch_size, num_particles, 3]
+                    particle_list[:, t, :, :] = proposed_particles
+                    
+                    # observation likelihood estimator network
+                    particle_probs = self.measurement_update(phi, proposed_particles, means, stds)
+                    particle_probs = particle_probs / torch.sum(particle_probs) # normalise so that probabilities add up to 1
+                    particle_prob_list[:, t, :] = particle_probs
+
+                # EXPERIMENT: disable ole network and just have the particle_prob_list be uniform probability every sequence
+                # particle_prob_list = torch.ones([batch_size, seq_len, num_particles], dtype=torch.float64) / num_particles
+
+                # compute loss
+                train_loss_OLE = loss_fn(batch, means, stds, self.world.obj_dims, self.world.r_robot) # do we need step sizes here?? object doesn't move...
+
+                # Backward and optimize
+                optimiser_OLE.zero_grad()
+                train_loss_OLE.backward()
+                # torch.nn.utils.clip_grad_norm_(self.particle_proposer.parameters(), 1)
+                optimiser_OLE.step()
+
+            # track training and validation loss at each epoch
+            # // need to implement //
+            train_loss_list_OLE[epoch] = train_loss_OLE
+
+            # increment epoch
+            epoch += 1
+
+        # plot training and validation loss
+        epochs = range(1, num_epochs_ole+1)
+        # plt.plot(epochs, train_loss_list_OLE, label='Training loss for OLE')
+
+        # # labels and axes
+        # plt.xlabel('Epochs')
+        # plt.ylabel('Loss')
+        # plt.title('Loss over epochs')
+        # plt.legend()
+
+
 
     # testing particle update given an observation
     def test(self, state_mins, state_maxs, means, stds, xy_only):
@@ -267,38 +361,82 @@ class DPF():
             contact_idx_new = np.where(o_hist==1)[0]
             self.world.plot_rollout(q_r_hist, o_hist)
 
+            # calculate phi observation
+            d, closest_point = dist_to_object(q_r_hist[contact_idx_new[0], :], self.world.qo_gt, self.world.obj_dims, self.world.r_robot)
+            self.world.q_r_0 = q_r_hist[contact_idx_new[0], :]
+            closest_point = closest_point - self.world.q_r_0
+            fixed_axis = [0, 1] # vertical axis in robot frame
+            observation_axis = closest_point
+            phi, phi_deg = angle_between_vectors(observation_axis, fixed_axis)
+            phi = torch.from_numpy(np.array([phi]))
+
             # propose particles
             q_r_desired = torch.from_numpy(a_hist[contact_idx_new[0]-1, :])
             q_r_achieved = torch.from_numpy(q_r_hist[contact_idx_new[0], :])
             observation = torch.from_numpy(np.array([o_hist[contact_idx_new[0]]]))
             print('Desired robot position during contact event:', q_r_desired[None, :])
             print('Achieved robot position during contact event:', q_r_achieved[None, :])
-            print('Observation during contact event:', observation[None, :])
+            # print('Observation during contact event:', observation[None, :])
+            print('Phi during contact event:', phi[None, :])
             state_mins = torch.from_numpy(state_mins).to(self.device)
             state_maxs = torch.from_numpy(state_maxs).to(self.device)
-            self.world.particles = self.propose_particles(q_r_desired[None, :], q_r_achieved[None, :], observation[None, :], self.world.num_particles, state_mins, state_maxs, xy_only) # shape [1, num_particles, 3]
+            # self.world.particles = self.propose_particles(q_r_desired[None, :], q_r_achieved[None, :], observation[None, :], self.world.num_particles, state_mins, state_maxs, xy_only) # shape [1, num_particles, 3]
+            self.world.particles = self.propose_particles(phi[None, :], self.world.num_particles, state_mins, state_maxs, xy_only) # shape [1, num_particles, 3]
+            
+            self.world.particles = self.world.particles.squeeze(0) # [num_particles, 3]
+            self.world.q_r_0 = q_r_hist[contact_idx_new[0], :]
+            # print(observation[None, :].shape)
+            # print(self.world.particles[None, :, :].shape)
+            self.world.weights = self.measurement_update(phi[None, :], self.world.particles[None, :, :], means, stds) # [batch_size, num_particles] = [1, 100]
+            self.world.weights = self.world.weights.squeeze() # [num_particles]
+            self.world.weights = self.world.weights / torch.sum(self.world.weights)
+            # print('Particle weights:', self.world.weights)
             
             # set all particle angles to zero (just for visualisation purposes)
-            if xy_only == True:
-                zero_angles = torch.zeros(1, self.world.num_particles, 1)
-                self.world.particles = torch.cat((self.world.particles, zero_angles), dim=-1)
+            # if xy_only == True:
+            #     zero_angles = torch.zeros(1, self.world.num_particles, 1)
+            #     self.world.particles = torch.cat((self.world.particles, zero_angles), dim=-1)
             
             # EXPERIMENT: use cos and sin as states for angles, instead of theta
             # self.world.particles[:, :, 2:3] = torch.atan2(self.world.particles[:, :, 3:4], self.world.particles[:, :, 2:3])
             # self.world.particles = self.world.particles[:, :, :3]
 
-            self.world.particles = self.world.particles.squeeze(0)
-            self.world.q_r_0 = q_r_hist[contact_idx_new[0], :]
-
-            # print(q_r_desired[None, :].shape)
-            # print(q_r_achieved[None, :].shape)
-            # print(observation[None, :].shape)
-            # print(self.world.particles[None, :, :].shape)
-            # self.world.weights = self.measurement_update(q_r_desired[None, :], q_r_achieved[None, :], observation[None, :], self.world.particles[None, :, :], means, stds)
-            # print(self.world.weights)
-
+            # get particle object position in world frame
+            self.world.particles[:, :2] = self.world.particles[:, :2] + q_r_achieved[None, :]
             # plot belief
             self.world.plot_belief_with_obs(q_r_desired, q_r_achieved)
+
+            # plot visualisation for particle weights
+            self.plot_particle_weights(self.world.particles, self.world.weights, q_r_achieved, s=5)
+
+            # test observation likelihood estimator
+            num_particles_per_axis = 100
+            particles = torch.zeros(num_particles_per_axis ** 2, 3)
+            particles[:, -1] = torch.rand(num_particles_per_axis ** 2) * (2*torch.pi) - torch.pi # random angle
+            particles = particles.view(num_particles_per_axis, num_particles_per_axis, 3)
+            x_axis_ticks = torch.linspace(-0.5, 0.5, num_particles_per_axis) - self.world.q_r_0[0]
+            y_axis_ticks = torch.linspace(0.5, 1.5, num_particles_per_axis) - self.world.q_r_0[1]
+            for i in range(num_particles_per_axis):
+                for j in range(num_particles_per_axis):
+                    particles[i, j, :2] = torch.tensor([x_axis_ticks[i], y_axis_ticks[j]])
+            particles = particles.view(num_particles_per_axis ** 2, 3)
+            weights = self.measurement_update(phi[None, :], particles[None, :, :], means, stds)
+            weights = weights / torch.sum(weights)
+            particles[:, :2] = particles[:, :2] + self.world.q_r_0[None, :]
+            self.plot_particle_weights(particles, weights, q_r_achieved, s=10)
+
+
+    # visualisation of particle weights
+    def plot_particle_weights(self, particles, weights, q_r_achieved, s):
+        plt.figure(figsize=(7.5, 7.5), dpi=100)
+        scatter = plt.scatter(particles[:, 0], particles[:, 1], c=weights, cmap='viridis', s=s)
+        plt.plot(q_r_achieved[0], q_r_achieved[1], 'x', c='red', label='Robot position')
+        plt.xlim([-0.5, 0.5])
+        plt.ylim([0.5, 1.5])
+        # Ensure the aspect ratio is equal, making x and y scales the same
+        plt.gca().set_aspect('equal', adjustable='box')
+        plt.colorbar(scatter, label='Weight intensity')
+        plt.legend()
 
     def plot_GMM(self, q_o, particle_list, particle_prob_list, xy_only):
         """
@@ -481,7 +619,7 @@ class DPF():
             # as long as propose ratio is less than 1.0, execute resampling and measurement update
             if self.propose_ratio < 1.0:
                 
-                # resampling
+                # resampling based on DPF paper
                 evenly_spaced_markers = torch.linspace(0.0, (num_resampled_float - 1.0) / num_resampled, num_resampled) # 'num_resampled' evenly spaced markers from 0 to 1
                 random_offset = torch.rand(self.batch_size, device=self.device) # generate a tensor of shape [batch_size] filled with random values between 0 and 1
                 random_offset *= random_offset * (1 / num_resampled_float) # tensor has shape [batch_size] and is filled with random values between 0 and 1 / num_resampled
@@ -493,6 +631,9 @@ class DPF():
                 standard_particle_probs = torch.ones(self.batch_size, num_resampled, device=self.device) # initialise tensor to store resampled particle probabilities --> shape [batch_size, sample_size]
                 standard_particles = standard_particles.detach() # stop gradient computation??
                 standard_particle_probs = standard_particle_probs.detach() # stop gradient computation??
+
+                # simple resampling
+                new_samples = particles[np.random.choice(np.arange(self.num_particles), num_resampled, p=standard_particle_probs)]
 
                 # motion update --> unnecessary as object pose does not change?
                 # measurement update
@@ -571,11 +712,11 @@ class DPF():
 class ParticleProposer(nn.Module):
 
     # initialise neural network architecture
-    def __init__(self, proposer_keep_ratio, xy_only):
+    def __init__(self, proposer_keep_ratio, xy_only, phi_dataset):
         super().__init__()
         if xy_only == False:
             self.linear_stack = nn.Sequential(
-                nn.Linear(4, 32),
+                nn.Linear(1, 32),
                 nn.ReLU(),
                 nn.Dropout(p=proposer_keep_ratio),
                 nn.Linear(32, 32),
@@ -619,7 +760,7 @@ class ObsLikelihoodEstimator(nn.Module):
     def __init__(self, min_obs_likelihood):
         super().__init__()
         self.linear_stack = nn.Sequential(
-            nn.Linear(9, 32),
+            nn.Linear(5, 32),
             nn.ReLU(),
             nn.Linear(32, 1),
             nn.Sigmoid(),
@@ -650,11 +791,17 @@ class TrajectoriesDataset(torch.utils.data.Dataset):
         start_idx = subseq_idx * self.seq_len
         end_idx = start_idx + self.seq_len
         
+        # sample = {
+        #     'q_o': self.data['q_o'][traj_idx, :, :],
+        #     'q_r': self.data['q_r'][traj_idx, start_idx:end_idx, :],
+        #     'o': self.data['o'][traj_idx, start_idx:end_idx, :],
+        #     'a': self.data['a'][traj_idx, start_idx:end_idx, :]
+        # }
         sample = {
             'q_o': self.data['q_o'][traj_idx, :, :],
             'q_r': self.data['q_r'][traj_idx, start_idx:end_idx, :],
-            'o': self.data['o'][traj_idx, start_idx:end_idx, :],
-            'a': self.data['a'][traj_idx, start_idx:end_idx, :]
+            'q_o_r': self.data['q_o_r'][traj_idx, start_idx:end_idx, :],
+            'phi': self.data['phi'][traj_idx, start_idx:end_idx, :]
         }
         return sample
 
@@ -667,15 +814,17 @@ class loss_fn_e2e(nn.Module):
         # GMM LOSS
         # std = 0.001
         # particle_std = 0.25
-        std = 0.2
-        particle_std = 0.2
+        std = 0.02 # 0.02
+        particle_std = 0.02 # 0.02
         print('particle_list', particle_list[0, 0, :10, :])
-        print('batch_q_o:', batch['q_o'][0, 0, :])
+        print('batch_q_o_r:', batch['q_o_r'][0, 0, :])
         # print('state_step_sizes:', state_step_sizes)
-        sq_distance = compute_sq_distance(particle_list, batch['q_o'], state_step_sizes, xy_only) # shape: [batch_size, seq_len, num_particles]
+        seq_len = particle_list.shape[1]
+        sq_distance = compute_sq_distance(particle_list, torch.cat((batch['q_o_r'], torch.tile(batch['q_o'][:, :, 2:3], (1, seq_len, 1))), dim=-1), state_step_sizes, xy_only) # shape: [batch_size, seq_len, num_particles]
         print('sq_distance:', sq_distance[0, 0, :10])
         std_tensor = torch.tensor(2.0 * np.pi * (std ** 2.0))
         # print('std_tensor:', std_tensor)
+        print('particle_prob_list', particle_prob_list[0, 0, :10])
         activations = (particle_prob_list / torch.sqrt(std_tensor)) * torch.exp(-sq_distance / (2.0 * (particle_std ** 2.0))) # shape: [batch_size, seq_len, num_particles]
         loss = torch.mean(-torch.log(1e-16 + torch.sum(activations, dim=-1)))
         print('activations:', activations[0, 0, :10])
@@ -703,6 +852,48 @@ class loss_fn_e2e(nn.Module):
         # print('sq_distance:', sq_distance)
 
         return loss
+    
+# individual loss for the observation likelihood estimator (OLE)
+class loss_OLE(nn.Module):
+    def __init__(self, dpf_instance):
+        super(loss_OLE, self).__init__()
+        self.dpf_instance = dpf_instance
+
+    def forward(self, batch, means, stds, obj_dims, r_robot):
+        # note: should i only take one time step here??
+        phi = batch['phi'][:, 0, :] # [batch_size, 1]
+        q_o_r = torch.cat((batch['q_o_r'][:, 0, :], batch['q_o'][:, 0, 2:3]), dim=-1) # [batch_size, 3]
+        batch_size = phi.shape[0]
+
+        # take the true object states and treat them as particles --> num_particles = batch_size
+        test_particles = torch.tile(q_o_r[None , :, :], (batch_size, 1, 1))
+
+        # apply observation likelihood estimator (OLE) for all pairs of observations and states in that batch
+        OLE_out = self.dpf_instance.measurement_update(phi, test_particles, means, stds) # [batch_size, num_particles] = [batch_size, batch_size]
+
+        # maximise probability at true states, minimise probability at all other states
+        true_state_probs = torch.diag(OLE_out) # [batch_size]
+        other_state_probs = OLE_out - torch.diag(true_state_probs) # [batch_size, batch_size]
+        # loss = torch.sum(-torch.log(true_state_probs)) / (batch_size) + torch.sum(-torch.log(1.0 - other_state_probs)) / (batch_size * (batch_size - 1)) # normalise the loss such that (correct -> 1, incorrect -> 0)
+        loss = torch.sum(-torch.log(true_state_probs)) + torch.sum(-torch.log(1.0 - other_state_probs)) # don't normalise
+
+        # # additional loss which penalises for high probabilities assigned to particles far away robot
+        # lower_bound = torch.tensor([r_robot]) + torch.sqrt((torch.from_numpy(np.atleast_1d(obj_dims[0])) ** 2.0) + (torch.from_numpy(np.atleast_1d(obj_dims[1])) ** 2.0))
+        # upper_bound = 1.5
+        # num_particles = 100
+        # q_o_r_random = torch.rand(num_particles, 2) * (upper_bound - lower_bound) + lower_bound
+        # angle_random = torch.rand(num_particles, 1) * (2*torch.pi) - torch.pi # random angle
+        # q_o_r = torch.cat((q_o_r_random, angle_random), dim=-1) # [num_particles, 3]
+        # q_o_r = torch.tile(q_o_r[None, :, :], (batch_size, 1, 1))
+        # print(q_o_r[0, :10, :])
+        # phi = torch.rand(batch_size, 1) * (2*torch.pi) - torch.pi # random angle
+        # probs = self.dpf_instance.measurement_update(phi, q_o_r, means, stds) # [1, num_particles]
+        # loss_far_away = torch.sum(-torch.log(1.0 - probs)) / num_particles
+        # print('loss_far_away:', loss_far_away)
+        
+        return loss
+
+
     
 # maximise GMM at true state, minimise GMM at all other states
 class loss_fn_max_min(nn.Module):
