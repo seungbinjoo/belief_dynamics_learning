@@ -146,6 +146,7 @@ class DPF():
         # initialise variables needed in the training loop
         epoch = 0
         train_loss_list = np.zeros((num_epochs_pp,))
+        val_loss_list = np.zeros((num_epochs_pp,))
 
         # training loop: go through epochs (number of epochs = 'num_epochs_pp')
         while epoch < num_epochs_pp:
@@ -191,9 +192,46 @@ class DPF():
                 train_loss.backward()
                 optimiser_e2e.step()
 
-            # track training and validation loss at each epoch
-            # // need to implement //
+            # track training loss at each epoch
             train_loss_list[epoch] = train_loss
+
+            # validation loop
+            with torch.no_grad():
+                val_loss = 0.0
+                for i, batch in enumerate(val_dataloader):
+                    # load to gpu 
+                    batch = {k: v.float().to(self.device) for k, v in batch.items()}
+                    
+                    # initialise matrix to store particles
+                    particle_list = torch.zeros([batch_size, seq_len, num_particles, self.state_dim], 
+                                                dtype=torch.float64, device=self.device)
+                    particle_prob_list = torch.zeros([batch_size, seq_len, num_particles], 
+                                                     dtype=torch.float64, device=self.device)
+
+                    # for each time step
+                    for t in range(seq_len):
+                        batch_t = {'q_o': batch['q_o'][:, :, :],
+                                'q_r': batch['q_r'][:, t, :],
+                                'q_o_r': batch['q_o_r'][:, t, :],
+                                'phi': batch['phi'][:, t, :]}
+
+                        # data for one timestep                
+                        q_o = batch_t['q_o'].squeeze(1) # shape [batch_size, 3]
+                        q_r_achieved = batch_t['q_r'].squeeze(1) # shape [batch_size, 2]
+                        q_o_r = batch_t['q_o_r'].squeeze(1) # shape [batch_size, 2]
+                        phi = batch_t['phi'] # shape [batch_size, 1]
+                        
+                        # propose particles
+                        proposed_particles = self.propose_particles(phi, num_particles, q_o_r_mins, q_o_r_maxs, xy_only) # shape [batch_size, num_particles, 3]
+                        particle_list[:, t, :, :] = proposed_particles
+
+                    # disable ole network and just have the particle_prob_list be uniform probability every sequence
+                    particle_prob_list = torch.ones([batch_size, seq_len, num_particles], dtype=torch.float64) / num_particles
+
+                    # compute loss
+                    val_loss = loss_fn(batch, particle_list, particle_prob_list, q_r_step_sizes, self.world, xy_only)
+
+                val_loss_list[epoch] = val_loss
 
             # increment epoch
             epoch += 1
@@ -201,7 +239,8 @@ class DPF():
         # plot training and validation loss
         epochs = range(1, num_epochs_pp+1)
         fig, axs = plt.subplots(2, figsize=(8, 8))
-        axs[0].plot(epochs, train_loss_list, label='Training loss for particle proposer')
+        axs[0].plot(epochs, train_loss_list, label='Training loss')
+        axs[0].plot(epochs, val_loss_list, label='Validation loss')
 
         # labels and axes
         axs[0].set_xlabel('Epochs')
@@ -216,6 +255,7 @@ class DPF():
         # initialise variables needed in the training loop
         epoch = 0
         train_loss_list_OLE = np.zeros((num_epochs_ole,))
+        val_loss_list_OLE = np.zeros((num_epochs_ole,))
         
         # training loop: go through epochs (number of epochs = 'num_epochs')
         while epoch < num_epochs_ole:
@@ -226,34 +266,6 @@ class DPF():
             for i, batch in enumerate(train_dataloader):
                 # load to gpu 
                 batch = {k: v.float().to(self.device) for k, v in batch.items()}
-                
-                # initialise matrix to store particles
-                particle_list = torch.zeros([batch_size, seq_len, num_particles, self.state_dim], 
-                                            dtype=torch.float64, device=self.device)
-                particle_prob_list = torch.zeros([batch_size, seq_len, num_particles], 
-                                                 dtype=torch.float64, device=self.device)
-
-                # for each time step
-                for t in range(seq_len):
-                    batch_t = {'q_o': batch['q_o'][:, :, :],
-                            'q_r': batch['q_r'][:, t, :],
-                            'q_o_r': batch['q_o_r'][:, t, :],
-                            'phi': batch['phi'][:, t, :]}
-
-                    # data for one timestep                
-                    q_o = batch_t['q_o'].squeeze(1) # shape [batch_size, 3]
-                    q_r_achieved = batch_t['q_r'].squeeze(1) # shape [batch_size, 2]
-                    q_o_r = batch_t['q_o_r'].squeeze(1) # shape [batch_size, 2]
-                    phi = batch_t['phi'] # shape [batch_size, 1]
-                    
-                    # propose particles
-                    proposed_particles = self.propose_particles(phi, num_particles, q_o_r_mins, q_o_r_maxs, xy_only) # shape [batch_size, num_particles, 3]
-                    particle_list[:, t, :, :] = proposed_particles
-                    
-                    # observation likelihood estimator network
-                    particle_probs = self.measurement_update(phi, proposed_particles, means, stds)
-                    particle_probs = particle_probs / torch.sum(particle_probs) # normalise so that probabilities add up to 1
-                    particle_prob_list[:, t, :] = particle_probs
 
                 # compute loss
                 train_loss_OLE = loss_fn(batch, means, stds, self.world.obj_dims, self.world.r_robot)
@@ -263,15 +275,28 @@ class DPF():
                 train_loss_OLE.backward()
                 optimiser_OLE.step()
 
-            # track training and validation loss at each epoch
+            # track training loss at each epoch
             train_loss_list_OLE[epoch] = train_loss_OLE
+
+            # validation loop
+            with torch.no_grad():
+                val_loss_OLE = 0.0
+                for i, batch in enumerate(val_dataloader):
+                    # load to gpu 
+                    batch = {k: v.float().to(self.device) for k, v in batch.items()}
+
+                    # compute validation loss
+                    val_loss_OLE = loss_fn(batch, means, stds, self.world.obj_dims, self.world.r_robot)
+
+                val_loss_list_OLE[epoch] = val_loss_OLE
 
             # increment epoch
             epoch += 1
 
         # plot training and validation loss
         epochs = range(1, num_epochs_ole+1)
-        axs[1].plot(epochs, train_loss_list_OLE, label='Training loss for OLE', c='green')
+        axs[1].plot(epochs, train_loss_list_OLE, label='Training loss')
+        axs[1].plot(epochs, val_loss_list_OLE, label='Validation loss')
 
         # labels and axes
         axs[1].set_xlabel('Epochs')
@@ -753,19 +778,24 @@ class loss_OLE(nn.Module):
 
     def forward(self, batch, means, stds, obj_dims, r_robot):
         # note: should only one time step be taken here??
-        phi = batch['phi'][:, 0, :] # [batch_size, 1]
-        q_o_r = torch.cat((batch['q_o_r'][:, 0, :], batch['q_o'][:, 0, 2:3]), dim=-1) # [batch_size, 3]
-        batch_size = phi.shape[0]
+        seq_len =  batch['phi'].shape[1]
+        batch_size = batch['phi'].shape[0]
+        loss = 0.0
 
-        # take the true object states and treat them as particles --> num_particles = batch_size
-        test_particles = torch.tile(q_o_r[None , :, :], (batch_size, 1, 1))
+        for t in range(seq_len):
+            phi = batch['phi'][:, t, :] # [batch_size, 1]
+            q_o_r = torch.cat((batch['q_o_r'][:, t, :], batch['q_o'][:, 0, 2:3]), dim=-1) # [batch_size, 3]
 
-        # apply observation likelihood estimator (OLE) for all pairs of observations and states in that batch
-        OLE_out = self.dpf_instance.measurement_update(phi, test_particles, means, stds) # [batch_size, num_particles] = [batch_size, batch_size]
+            # take the true object states and treat them as particles --> num_particles = batch_size
+            test_particles = torch.tile(q_o_r[None , :, :], (batch_size, 1, 1))
 
-        # maximise probability at true states, minimise probability at all other states
-        true_state_probs = torch.diag(OLE_out) # [batch_size]
-        other_state_probs = OLE_out - torch.diag(true_state_probs) # [batch_size, batch_size]
-        loss = torch.sum(-torch.log(true_state_probs)) + torch.sum(-torch.log(1.0 - other_state_probs)) # this line does not normalise the loss
+            # apply observation likelihood estimator (OLE) for all pairs of observations and states in that batch
+            OLE_out = self.dpf_instance.measurement_update(phi, test_particles, means, stds) # [batch_size, num_particles] = [batch_size, batch_size]
+
+            # maximise probability at true states, minimise probability at all other states
+            true_state_probs = torch.diag(OLE_out) # [batch_size]
+            other_state_probs = OLE_out - torch.diag(true_state_probs) # [batch_size, batch_size]
+            loss_at_t = torch.sum(-torch.log(true_state_probs)) + torch.sum(-torch.log(1.0 - other_state_probs)) # this line does not normalise the loss
+            loss += loss_at_t
         
         return loss

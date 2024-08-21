@@ -28,6 +28,7 @@ def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=
         data['q_o'][i, :, :] = q_o_traj[None, :]
 
         # store robot pose histories for all trajectories
+        q_r_traj = np.expand_dims(q_r_traj[:num_steps_per_sequence, :], axis=0)
         data['q_r'][i, :, :] = q_r_traj
 
         # store object pose in robot frame for all trajectories
@@ -35,15 +36,15 @@ def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=
 
         # store observation histories for all trajectories
         # note: initially, phi_traj has shape () --> scalar np array
-        data['phi'][i, :, :] = phi_traj[None, None]
+        data['phi'][i, :, :] = np.array(phi_traj)[None, None]
 
         # store closest point data --> won't be used in training though
-        data['cp'][i, :, :] = cp_traj[None, :]
+        data['cp'][i, :, :] = np.array(cp_traj)[None, :]
 
-    # # if we desire trajectories with only contacts, for q_r, o, a, only take data from the single index with contact
-    # if contact_only == True:
-    #     data['q_r'] = np.expand_dims(data['q_r'][:, 1, :], axis=1)
-    #     data['q_o_r'] = np.expand_dims(data['q_o_r'][:, 1, :], axis=1)
+    # if we desire trajectories with only contacts, for q_r, o, a, only take data from the single index with contact
+    if contact_only == True:
+        data['q_r'] = np.expand_dims(data['q_r'][:, 1, :], axis=1)
+        data['q_o_r'] = np.expand_dims(data['q_o_r'][:, 1, :], axis=1)
     
     # if we only want xy states, get rid of angles from the dataset
     if xy_only == True:
