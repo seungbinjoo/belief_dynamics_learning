@@ -53,7 +53,23 @@ def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=
     return data
 
 def noisify_data(data):
-    data = data
+    # define shape parameters
+    batch_size = data['q_r'].shape[0]
+    seq_len = data['q_r'].shape[1]
+    state_dim = data['q_o'].shape[-1]
+    
+    # define noise factors
+    q_o_noise_factor = 0.015
+    q_r_noise_factor = 0.015
+    q_o_r_noise_factor = 0.01
+    phi_noise_factor = 0.3
+    
+    # apply noise
+    data['q_o'] = data['q_o'] + (np.random.rand(batch_size, 1, state_dim) * q_o_noise_factor - (q_o_noise_factor/2))
+    data['q_r'] = data['q_r'] + (np.random.rand(batch_size, seq_len, 2) * q_r_noise_factor - (q_r_noise_factor/2))
+    data['q_o_r'] = data['q_o_r'] + (np.random.rand(batch_size, seq_len, 2) * q_o_r_noise_factor - (q_o_r_noise_factor/2))
+    data['phi'] = data['phi'] + (np.random.rand(batch_size, seq_len, 1) * phi_noise_factor - (phi_noise_factor/2))
+
     return data
 
 def check_errors_data(data, obj_dims, r_robot, xy_only):

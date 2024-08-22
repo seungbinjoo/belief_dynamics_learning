@@ -59,8 +59,8 @@ class DPF():
         Args:
             batch: for one timestep, batches of object pose, robot pose, object pose in robot frame, observation phi, closest point
             particles: for one timestep, shape [batch_size, num_particles, 3]
-            means: dictionary {'q_o': [1, 1, 3], 'q_r': [1, 1, 3], ...}
-            stds: dictionary {'q_o': [1, 1, 3], 'q_r': [1, 1, 3], ...}
+            means: dictionary {'q_o': [1, 1, 3], 'q_r': [1, 1, 2], ...}
+            stds: dictionary {'q_o': [1, 1, 3], 'q_r': [1, 1, 2], ...}
         """
 
         # prepare input to the observation likelihood estimator network
@@ -148,7 +148,7 @@ class DPF():
         train_loss_list = np.zeros((num_epochs_pp,))
         val_loss_list = np.zeros((num_epochs_pp,))
 
-        # training loop: go through epochs (number of epochs = 'num_epochs_pp')
+        # training loop for particle proposer
         while epoch < num_epochs_pp:
             # print the epoch number at the start of each epoch
             print(f"Epoch {epoch+1}/{num_epochs_pp}")
@@ -257,7 +257,7 @@ class DPF():
         train_loss_list_OLE = np.zeros((num_epochs_ole,))
         val_loss_list_OLE = np.zeros((num_epochs_ole,))
         
-        # training loop: go through epochs (number of epochs = 'num_epochs')
+        # training loop for OLE
         while epoch < num_epochs_ole:
             # print the epoch number at the start of each epoch
             print(f"Epoch {epoch+1}/{num_epochs_ole}")
@@ -536,8 +536,8 @@ class DPF():
     # belief update loop with resampling, prediction, and measurement update steps
     def belief_update_loop(self, batch, num_particles, means, stds, state_mins, state_maxs, state_step_sizes):
         # get shapes and define parameters
-        self.batch_size = batch['q_o'].shape[0]
-        self.seq_len = batch['q_o'].shape[1]
+        self.batch_size = batch['q_r'].shape[0]
+        self.seq_len = batch['q_r'].shape[1]
         self.num_particles = num_particles
 
         # initialise particles --> samples particles randomly according to uniform distribution between state minimums and maximums
