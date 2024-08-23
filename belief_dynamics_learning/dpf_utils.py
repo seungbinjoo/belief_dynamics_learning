@@ -59,16 +59,16 @@ def noisify_data(data):
     state_dim = data['q_o'].shape[-1]
     
     # define noise factors
-    q_o_noise_factor = 0.015
-    q_r_noise_factor = 0.015
-    q_o_r_noise_factor = 0.01
-    phi_noise_factor = 0.3
+    q_o_noise_sigma = 0.015
+    q_r_noise_sigma = 0.015
+    q_o_r_noise_sigma = 0.01
+    phi_noise_sigma = 0.1
     
     # apply noise
-    data['q_o'] = data['q_o'] + (np.random.rand(batch_size, 1, state_dim) * q_o_noise_factor - (q_o_noise_factor/2))
-    data['q_r'] = data['q_r'] + (np.random.rand(batch_size, seq_len, 2) * q_r_noise_factor - (q_r_noise_factor/2))
-    data['q_o_r'] = data['q_o_r'] + (np.random.rand(batch_size, seq_len, 2) * q_o_r_noise_factor - (q_o_r_noise_factor/2))
-    data['phi'] = data['phi'] + (np.random.rand(batch_size, seq_len, 1) * phi_noise_factor - (phi_noise_factor/2))
+    data['q_o'] = data['q_o'] + np.random.normal(loc=0.0, scale=q_o_noise_sigma, size=(batch_size, 1, state_dim))
+    data['q_r'] = data['q_r'] + np.random.normal(loc=0.0, scale=q_r_noise_sigma, size=(batch_size, seq_len, 2))
+    data['q_o_r'] = data['q_o_r'] + np.random.normal(loc=0.0, scale=q_o_r_noise_sigma, size=(batch_size, seq_len, 2))
+    data['phi'] = data['phi'] + np.random.normal(loc=0.0, scale=phi_noise_sigma, size=(batch_size, seq_len, 1))
 
     return data
 
