@@ -10,9 +10,12 @@ def plot_robot(ax, qr, r_robot, color='blue', alpha=1.):
 
 def plot_object(ax, qo, dim_object, color='blue', alpha=1., zorder=None):
     # qo: [x, y, theta]
-    if color =='blue': 
+    if color =='blue':
         edgecolor = 'darkblue'
         zorder= 9
+    elif color == 'green':
+        edgecolor = 'darkgreen'
+        zorder = 9
     elif color == 'orange':
         edgecolor = 'darkorange'
         zorder = 8
@@ -27,7 +30,7 @@ def plot_object(ax, qo, dim_object, color='blue', alpha=1., zorder=None):
                                    edgecolor=edgecolor, linewidth=0.5, zorder=zorder,
                                    alpha=alpha))
 
-def plot_object_belief(ax, bo, w, dim_obj, color='red', alpha_factor=10):
+def plot_object_belief(ax, bo, w, dim_obj, color='red', alpha_factor=10, particle_color='blue'):
     # b: list of [x, y, theta]
     # num particles with w < 1e-3
     # print(np.sum(w < 1e-4))
@@ -36,12 +39,12 @@ def plot_object_belief(ax, bo, w, dim_obj, color='red', alpha_factor=10):
             alpha = 0.2
             color = 'orange'
         else: 
-            color = 'blue'
+            color = particle_color
             alpha_factor = 2. 
             alpha = np.min([1,wo*alpha_factor])
             alpha = np.max([0.1, alpha])
             # alpha=0.3
-        plot_object(ax, qo, dim_obj, color=color, alpha=alpha)
+        plot_object(ax, qo, dim_obj, color=particle_color, alpha=alpha)
 
 def plot_observation(ax, q_r_desired, q_r_achieved):
     # Plot the points
