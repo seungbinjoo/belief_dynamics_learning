@@ -11,18 +11,23 @@ def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=
     q_o = np.zeros((num_sequences, 1, 3), dtype=float) # object pose
     q_r = np.zeros((num_sequences, num_steps_per_sequence, 2), dtype=float) # robot pose
     q_o_r = np.zeros((num_sequences, num_steps_per_sequence, 2), dtype=float) # object pose in robot frame
+    o = np.zeros((num_sequences, num_steps_per_sequence, 1), dtype=float) # observation binary variable
     phi = np.zeros((num_sequences, num_steps_per_sequence, 1), dtype=float) # phi observation
     cp = np.zeros((num_sequences, num_steps_per_sequence, 2), dtype=float) # closest point
 
     data = {'q_o': q_o,
             'q_r': q_r,
             'q_o_r': q_o_r,
+            'o': o,
             'phi': phi,
             'cp': cp}
     
     # store contents of raw data file into q_o, q_r, phi
     for i, trajectory in enumerate(raw_data):
-        q_o_traj, q_r_traj, phi_traj, cp_traj = trajectory
+        if contact_only == True:
+            q_o_traj, q_r_traj, phi_traj, cp_traj = trajectory
+        else:
+            q_o_traj, q_r_traj, o_traj, phi_traj, cp_traj = trajectory
         
         # store object pose for all trajectories
         data['q_o'][i, :, :] = q_o_traj[None, :]
@@ -34,9 +39,19 @@ def organise_data(raw_data, num_sequences, num_steps_per_sequence, contact_only=
         # store object pose in robot frame for all trajectories
         data['q_o_r'] = data['q_o'][:, :, :2] - data['q_r']
 
+        if contact_only == False:
+            # store observation binary variable
+            o_traj = np.expand_dims(o_traj[:num_steps_per_sequence], axis=(0,2))
+            data['o'][i, :, :] = o_traj
+        else:
+            pass
+
         # store observation histories for all trajectories
         # note: initially, phi_traj has shape () --> scalar np array
-        data['phi'][i, :, :] = np.array(phi_traj)[None, None]
+        if num_steps_per_sequence == 2:
+            data['phi'][i, :, :] = np.array(phi_traj)[None, None] # for single timestep data (contact-only)
+        else:
+            data['phi'][i, :, :] = np.array(phi_traj)[:, None] # for longer trajectories that aren't contact-only
 
         # store closest point data --> won't be used in training though
         data['cp'][i, :, :] = np.array(cp_traj)[None, :]
@@ -108,7 +123,7 @@ def check_errors_data(data, obj_dims, r_robot, xy_only):
 def split_data(data, split_ratio):
     
     # keys for dictionary which contains data
-    keys = ['q_o', 'q_r', 'q_o_r', 'phi', 'cp']
+    keys = ['q_o', 'q_r', 'q_o_r', 'o', 'phi', 'cp']
 
     # number of trajectories in the data
     num_trajectories = data['q_o'].shape[0]
@@ -277,3 +292,27 @@ def angle_between_vectors(u, v):
     angle_deg = np.degrees(angle_rad)
     
     return angle_rad, angle_deg
+
+def compute_squared_error(q_o, particle):
+    """
+    Args:
+        q_o: ground truth object state [3]
+        particle: particle state [3]
+    Output:
+        squared_error_xy: squared error for xy position
+        squared_error_theta: squared error for orientation angle theta
+    """
+
+    state_dim = particle.shape[0]
+    squared_error_xy = 0
+    squared_error_theta = 0
+
+    for i in range(state_dim):
+        diff = q_o[i] - particle[i]
+        if i == 2:
+            diff = wrap_angle(diff)
+            squared_error_theta = squared_error_theta + (diff ** 2.0)
+        else:
+            squared_error_xy = squared_error_xy + (diff ** 2.0)
+
+    return squared_error_xy, squared_error_theta
