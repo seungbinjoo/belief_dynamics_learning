@@ -210,7 +210,7 @@ class World2D:
                     loc='upper left', fontsize=14)
         plt.show()
 
-    def step(self, x, q_o, sigma_a=0.5):
+    def step(self, x, q_o, sigma_a=0.12): # if sigma_a is too high, the "while x_diff..." loop runs too often
         """
         Sample a random walk motion model for the robot.
         x_t = x_{t-1} + v_{t-1} * dt + 1/2 * a_t * dt^2 
@@ -223,9 +223,15 @@ class World2D:
             x_new: new robot state [4]
             o: contact observation (1 if in contact, 0 otherwise)
         """
+        x_diff = 1
+        margin = 0.0335 + 0.001
         mean_a = np.zeros(2)
-        a = np.random.normal(mean_a, sigma_a)
-        x_new = np.dot(self.A, x) + np.dot(self.B, a)
+
+        # keep sampling acceleration until we ensure that acceleration is small enough so that x_diff isn't too large, which could cause the robot to clip through the object
+        while np.abs(x_diff) > np.abs(np.min(self.obj_dims) - margin):
+            a = np.random.normal(mean_a, sigma_a)
+            x_new = np.dot(self.A, x) + np.dot(self.B, a)
+            x_diff = np.linalg.norm(x_new[:2] - x[:2])
         
         # check for contact
         d, _ = dist_to_object(x_new[:2], q_o, self.obj_dims, self.r_robot) 
@@ -248,21 +254,35 @@ class World2D:
             q_r_o = R_object.T @ (x_new[:2] - q_o[:2])
             # find closest point on object surface
             q_r_o_normalized = q_r_o / (self.obj_dims/2) # 1 if on the surface
+            # print('q_r_o_normalised:', q_r_o_normalized)
             if np.abs(q_r_o_normalized[0]) > 1 and np.abs(q_r_o_normalized[1]) > 1:
                 # Closest point is on the corner
                 q_o_closest = np.sign(q_r_o_normalized)
             elif np.abs(q_r_o_normalized[0]) > np.abs(q_r_o_normalized[1]):
                 # move to x border
                 q_o_closest = np.array([np.sign(q_r_o_normalized[0]), q_r_o_normalized[1]])
+                # print('q_o_closest in if statement:', q_o_closest)
             else:
                 # move to y border
                 q_o_closest = np.array([q_r_o_normalized[0], np.sign(q_r_o_normalized[1])])
             q_o_closest *= self.obj_dims/2
+            # print('q_o_closest after scaling:', q_o_closest)
             dq_r_o_new = q_r_o - q_o_closest
+            # print('dq_r_o_new:', dq_r_o_new)
             dq_r_o_new *= self.r_robot / np.linalg.norm(dq_r_o_new)
+            # print('dq_r_o_new scaled:', dq_r_o_new)
             q_r_o_new = q_o_closest + dq_r_o_new
+            # print('q_r_o_new:', q_r_o_new)
             x_new[:2] = np.dot(R_object, q_r_o_new) + q_o[:2]
             # self.plot_single_step(q_des, x_new[:2], q_o)
+
+            # test whether object is intersecting with robot
+            # d_test, _test = dist_to_object(x_new[:2], q_o, self.obj_dims, self.r_robot) 
+            # if d_test < -0.005:
+            #     print('Deflection error detected')
+            #     print(d_test)
+            #     print('acceleration:', a)
+            #     print('x_diff:', x_diff)
         else: 
             o = 0
         # clip velocity
