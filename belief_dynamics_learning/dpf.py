@@ -1,4 +1,5 @@
 import numpy as np
+import tqdm
 import math
 import torch
 import torch.nn as nn
@@ -54,6 +55,9 @@ class DPF():
         # OBSERVATION LIKELIHOOD ESTIMATOR --> maps observations and robot poses to probabilities
         self.obs_like_estimator = ObsLikelihoodEstimator(self.min_obs_likelihood).to(self.device)
 
+        # NEGATIVE PROPOSER --> given a particle, decides whether to keep or discard particle from belief set
+        self.negative_proposer = NegativeProposer().to(self.device)
+
     # compute observation likelihood (probabilities) for a particle set
     def measurement_update(self, phi, particles, means, stds):
         """
@@ -85,6 +89,9 @@ class DPF():
         # ensure means and stds are torch tensors
         means_q_o_r = torch.tensor(means['q_o_r'], device=self.device)
         stds_q_o_r = torch.tensor(stds['q_o_r'], device=self.device)
+
+        # to avoid in place operations which interferes with gradient flow computation?
+        particles = particles.clone()
 
         input = torch.cat((
             (particles[:, :, :2] - means_q_o_r[None, None, :2]) / stds_q_o_r[None, None, :2],
@@ -125,6 +132,7 @@ class DPF():
         return proposed_particles
     
     # for now training loop ignores resampling --> all the particles in the loop are from the particle proposer (no resampling from the previous particle set)
+    # training here is based on one-timestep data
     def fit(self, data, split_ratio, batch_size, seq_len, num_epochs_pp, num_epochs_ole, learning_rate, num_particles, xy_only, phi_dataset):
         
         # split data into training and validation set
@@ -250,7 +258,7 @@ class DPF():
         axs[0].set_title('Loss over epochs for particle proposer')
         axs[0].legend()
 
-        # TRAINING THE OOBSERVATION LIKELIHOOD ESTIMATOR
+        # TRAINING THE OBSERVATION LIKELIHOOD ESTIMATOR
         optimiser_OLE = torch.optim.Adam(self.obs_like_estimator.parameters(), lr=learning_rate)
         loss_fn = self.OLE_loss_fn
 
@@ -307,8 +315,47 @@ class DPF():
         axs[1].legend()
         fig.tight_layout()
 
-    def fit_with_resampling(self, data, split_ratio, batch_size, seq_len, num_epochs_pp, num_epochs_ole, learning_rate, num_particles, xy_only, phi_dataset):
+    # training process that takes into account resampling when contact events occur
+    # note: requires contact_only to be set to False
+    def fit_with_resampling(self, data, split_ratio, batch_size, seq_len, num_epochs_pp, num_epochs_ole, num_epochs_np, learning_rate, num_particles, xy_only, phi_dataset, num_contacts_desired):
         
+        def get_batch_contacts(batch, num_contacts_desired):
+            '''
+            Args: batch = {'q_o': [batch_size, 1, 3],
+                           'q_r': [batch_size, seq_len, state_dim]
+                           ... }
+            Output: batch_contacts = {'q_o': [batch_size, 1, 3],
+                                      'q_r': [batch_size, num_contacts_desired, state_dim]
+                                      ... }
+            '''
+            # initialise dictionary where batch_contacts will be stored
+            batch_contacts = {'q_o': torch.zeros(batch_size, 1, 3),
+                              'q_r': torch.zeros(batch_size, num_contacts_desired, 2),
+                              'q_o_r': torch.zeros(batch_size, num_contacts_desired, 2),
+                              'o': torch.zeros(batch_size, num_contacts_desired, 1),
+                              'phi': torch.zeros(batch_size, num_contacts_desired, 1),
+                              'cp': torch.zeros(batch_size, num_contacts_desired, 2)}
+            
+            keys = ['q_r', 'q_o_r', 'o', 'phi', 'cp'] # no need to extract contact events for 'q_o'
+
+            # initialise matrix that will store the indices of contacts
+            contact_idx = torch.zeros(batch_size, num_contacts_desired)
+
+            for traj in range(batch_size):
+                # extract indices of the contact events
+                indices = torch.where(batch['o'][traj, :, 0] == 1)[0]
+
+                # number of indices extracted is determined by num_contacts_desired
+                indices = indices[:num_contacts_desired]
+                
+                # fill in values in batch_contacts using extracted indices
+                for key in keys:
+                    batch_contacts[key][traj, :, :] = batch[key][traj, indices, :]
+
+                batch_contacts['q_o'] = batch['q_o']
+            
+            return batch_contacts
+
         # split data into training and validation set
         train_data, val_data = split_data(data, split_ratio)
 
@@ -322,9 +369,521 @@ class DPF():
         # compute some statistics about training data
         means, stds, q_o_r_maxs, q_o_r_mins, q_r_step_sizes, q_r_maxs, q_r_mins = compute_statistics(train_data, phi_dataset)
 
+        # TRAINING THE PARTICLE PROPOSER
+        # enable anomaly detection for debugging
+        # torch.autograd.set_detect_anomaly(True)
 
+        # optimiser and loss
+        optimiser_e2e = torch.optim.Adam(self.particle_proposer.parameters(), lr=learning_rate)
+        loss_fn = loss_fn_e2e()
 
-    # testing particle update given an observation
+        # initialise variables needed in the training loop
+        epoch = 0
+        train_loss_list = np.zeros((num_epochs_pp,))
+        val_loss_list = np.zeros((num_epochs_pp,))
+
+        # training loop for particle proposer
+        while epoch < num_epochs_pp:
+            # print the epoch number at the start of each epoch
+            print(f"Epoch {epoch+1}/{num_epochs_pp}")
+
+            # training loop: for each epoch, go through multiple batches --> e.g. q_o batch has dimensions [batch_size, seq_len, 3]
+            for i, batch in enumerate(train_dataloader):
+                # load to gpu 
+                batch = {k: v.float().to(self.device) for k, v in batch.items()}
+
+                # convert batch such that it only contains data from contact event timesteps
+                batch_contacts = get_batch_contacts(batch, num_contacts_desired) # 'q_o': [batch_size, 1, 3], 'q_r': [batch_size, num_contacts_desired, 2]
+
+                # sequence length is essentially now the number of contact events as this is the number of times we will be applying belief update loop
+                seq_len = num_contacts_desired
+                
+                # initialisation
+                particle_list = torch.zeros([batch_size, seq_len, num_particles, self.state_dim], dtype=torch.float64, device=self.device)
+                particles = torch.zeros(batch_size, num_particles, self.state_dim)
+                phi = (torch.rand(batch_size, 1) * 2 * math.pi) - math.pi # sample random phi from between -pi and pi
+                state_mins = torch.from_numpy(q_o_r_mins).to(self.device)
+                state_maxs = torch.from_numpy(q_o_r_maxs).to(self.device)
+                particles = self.propose_particles(phi, num_particles, state_mins, state_maxs, xy_only) # [batch_size, num_particles, state_dim]
+                particles = particles.squeeze(0)
+                particle_list[:, 0, :, :] = particles
+
+                particle_prob_list = torch.zeros([batch_size, seq_len, num_particles], dtype=torch.float64, device=self.device)
+                particle_probs = torch.zeros(batch_size, num_particles)
+                particle_probs = self.measurement_update(phi, particle_list[:, 0, :, :], means, stds) # [batch_size, num_particles] = [20, 100]
+                particle_probs = particle_probs.squeeze(0)
+                particle_probs = particle_probs / torch.sum(particle_probs, dim=1, keepdim=True) # normalise
+                particle_prob_list[:, 0, :] = particle_probs
+
+                # convert particles to world frame
+                particles[:, :, :2] = particles[:, :, :2] + batch_contacts['q_r'][:, 0:1, :2]
+                particle_list[:, 0, :, :] = particles
+
+                # for each time step, i.e. each contact event
+                for t in range(seq_len):
+                    # determine number of particles to propose and number of particles to resample, based on propose ratio
+                    # propose_ratio is ratio of proposed to resampled particles --> this follows an exponential function (gamma)^(t-1)
+                    num_proposed_float = torch.round(torch.tensor((self.propose_ratio ** int(t+1))) * self.num_particles_float)
+                    num_proposed = num_proposed_float.int()
+                    num_resampled_float = self.num_particles_float - num_proposed_float
+                    num_resampled = num_resampled_float.int()
+
+                    # as long as propose ratio is less than 1.0, execute resampling and measurement update
+                    if self.propose_ratio < 1.0:
+                        # stop gradients flowing through resampling step
+                        with torch.no_grad():
+                            # simple resampling --> for batches
+                            resampled_indices = np.zeros((batch_size, num_resampled.item()))
+
+                            for b in range(batch_size):
+                                # get the particle probabilities for the current batch item
+                                current_probs = particle_probs[b, :]
+                                
+                                # resample indices for this batch item
+                                indices = np.random.choice(np.arange(num_particles), torch.Tensor.numpy(num_resampled), p=torch.Tensor.numpy(current_probs))
+                                # append the resampled indices for this batch item
+                                resampled_indices[b, :] = indices
+
+                            # resampled particles for batch
+                            resampled_particles = torch.zeros(batch_size, num_resampled, 3)
+
+                            for b in range(batch_size):
+                                resampled_particles[b, :, :] = particles[b, resampled_indices[b, :], :]
+
+                        # get phi
+                        phi = batch_contacts['phi'][:, t, :] # [batch_size, 1]
+
+                        # measurement update
+                        resampled_particles[:, :, :2] = resampled_particles[:, :, :2] - batch_contacts['q_r'][:, t:t+1, :] # convert particles to robot frame
+                        resampled_particle_probs = self.measurement_update(phi, resampled_particles, means, stds)
+                        resampled_particle_probs = resampled_particle_probs.squeeze(0)
+                        resampled_particle_probs = resampled_particle_probs / torch.sum(resampled_particle_probs, dim=1, keepdim=True)
+
+                    # as long as propose ratio is greater than 0.0, execute particle proposing step
+                    if self.propose_ratio > 0.0:
+                        
+                        # proposed particles
+                        proposed_particles = self.propose_particles(phi, num_proposed, state_mins, state_maxs, xy_only)
+                        proposed_particles = proposed_particles.squeeze(0)
+                        proposed_particle_probs = torch.ones(batch_size, num_proposed) / num_proposed
+
+                    # combine standard particles (particles that were resampled in the beginning of the loop and went through measurement update) with proposed particles
+                    if self.propose_ratio == 1.0:
+                        
+                        # then all of the proposed particles are used in the new particle set
+                        # particles[:, :, :2] = proposed_particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                        particle_probs = proposed_particle_probs
+
+                    # if propose_ratio is 0
+                    elif self.propose_ratio == 0.0:
+                        
+                        # then all of the resampled particles are used in the new particle set
+                        # particles[:, :, :2] = resampled_particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                        particle_probs = resampled_particle_probs
+
+                    # otherwise, the new particle set is a combination of resampled (standard) particles and proposed particles --> propose ratio = ratio of proposed to resampled particles
+                    else:
+                        
+                        # prepare to combine resampled particles and proposed particle probabilities
+                        resampled_particle_probs = resampled_particle_probs * (num_resampled_float / self.num_particles_float)
+                        proposed_particle_probs = proposed_particle_probs * (num_proposed_float / self.num_particles_float)
+
+                        # combine resampled and proposed particles
+                        particles = torch.cat([resampled_particles, proposed_particles], dim=1) # concat in num_particles dimension [batch_size, num_particles, state_dim]
+                        # particles[:, :, :2] = particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                        particle_probs = torch.cat([resampled_particle_probs, proposed_particle_probs], dim=1) # concat in num_particles dimension [batch_size, num_particles]
+
+                    # normalise probabilites
+                    particle_probs = particle_probs / torch.sum(particle_probs, dim=1, keepdim=True)
+
+                    # add particles and particle probabilities from this timestep to the list
+                    particle_list[:, t, :, :] = particles
+                    particle_prob_list[:, t, :] = particle_probs
+
+                # disable ole network and just have the particle_prob_list be uniform probability every sequence
+                particle_prob_list = torch.ones([batch_size, seq_len, num_particles], dtype=torch.float64) / num_particles
+
+                # experiment: compute loss only for final timestep
+                batch_contacts['q_o_r'] = batch_contacts['q_o_r'][:, -2:-1, :]
+
+                # compute loss --> experiment: compute loss only using final contact event timestep particle set
+                train_loss = loss_fn(batch_contacts, particle_list[:, -2:-1, :, :], particle_prob_list[:, -2:-1, :], q_r_step_sizes, self.world, xy_only)
+
+                # backward and optimize
+                optimiser_e2e.zero_grad()
+                train_loss.backward()
+                optimiser_e2e.step()
+
+            # track training loss at each epoch
+            train_loss_list[epoch] = train_loss
+            
+            # validation loop
+            with torch.no_grad():
+                # training loop: for each epoch, go through multiple batches --> e.g. q_o batch has dimensions [batch_size, seq_len, 3]
+                for i, batch in enumerate(val_dataloader):
+                    # load to gpu 
+                    batch = {k: v.float().to(self.device) for k, v in batch.items()}
+
+                    # convert batch such that it only contains data from contact event timesteps
+                    batch_contacts = get_batch_contacts(batch, num_contacts_desired) # 'q_o': [batch_size, 1, 3], 'q_r': [batch_size, num_contacts_desired, 2]
+
+                    # sequence length is essentially now the number of contact events as this is the number of times we will be applying belief update loop
+                    seq_len = num_contacts_desired
+                    
+                    # initialisation
+                    particle_list = torch.zeros([batch_size, seq_len, num_particles, self.state_dim], dtype=torch.float64, device=self.device)
+                    particles = torch.zeros(batch_size, num_particles, self.state_dim)
+                    phi = (torch.rand(batch_size, 1) * 2 * math.pi) - math.pi # sample random phi from between -pi and pi
+                    state_mins = torch.from_numpy(q_o_r_mins).to(self.device)
+                    state_maxs = torch.from_numpy(q_o_r_maxs).to(self.device)
+                    particles = self.propose_particles(phi, num_particles, state_mins, state_maxs, xy_only) # [batch_size, num_particles, state_dim]
+                    particles = particles.squeeze(0)
+                    particle_list[:, 0, :, :] = particles
+
+                    particle_prob_list = torch.zeros([batch_size, seq_len, num_particles], dtype=torch.float64, device=self.device)
+                    particle_probs = torch.zeros(batch_size, num_particles)
+                    particle_probs = self.measurement_update(phi, particle_list[:, 0, :, :], means, stds) # [batch_size, num_particles] = [20, 100]
+                    particle_probs = particle_probs.squeeze(0)
+                    particle_probs = particle_probs / torch.sum(particle_probs, dim=1, keepdim=True) # normalise
+                    particle_prob_list[:, 0, :] = particle_probs
+
+                    # convert particles to world frame
+                    particles[:, :, :2] = particles[:, :, :2] + batch_contacts['q_r'][:, 0:1, :2]
+                    particle_list[:, 0, :, :] = particles
+
+                    # for each time step, i.e. each contact event
+                    for t in range(seq_len):
+                        # determine number of particles to propose and number of particles to resample, based on propose ratio
+                        # propose_ratio is ratio of proposed to resampled particles --> this follows an exponential function (gamma)^(t-1)
+                        num_proposed_float = torch.round(torch.tensor((self.propose_ratio ** int(t+1))) * self.num_particles_float)
+                        num_proposed = num_proposed_float.int()
+                        num_resampled_float = self.num_particles_float - num_proposed_float
+                        num_resampled = num_resampled_float.int()
+
+                        # as long as propose ratio is less than 1.0, execute resampling and measurement update
+                        if self.propose_ratio < 1.0:
+                            # stop gradients flowing through resampling step
+                            with torch.no_grad():
+                                # simple resampling --> for batches
+                                resampled_indices = np.zeros((batch_size, num_resampled.item()))
+
+                                for b in range(batch_size):
+                                    # get the particle probabilities for the current batch item
+                                    current_probs = particle_probs[b, :]
+                                    
+                                    # resample indices for this batch item
+                                    indices = np.random.choice(np.arange(num_particles), torch.Tensor.numpy(num_resampled), p=torch.Tensor.numpy(current_probs))
+                                    # append the resampled indices for this batch item
+                                    resampled_indices[b, :] = indices
+
+                                # resampled particles for batch
+                                resampled_particles = torch.zeros(batch_size, num_resampled, 3)
+
+                                for b in range(batch_size):
+                                    resampled_particles[b, :, :] = particles[b, resampled_indices[b, :], :]
+
+                            # get phi
+                            phi = batch_contacts['phi'][:, t, :] # [batch_size, 1]
+
+                            # measurement update
+                            resampled_particles[:, :, :2] = resampled_particles[:, :, :2] - batch_contacts['q_r'][:, t:t+1, :] # convert particles to robot frame
+                            resampled_particle_probs = self.measurement_update(phi, resampled_particles, means, stds)
+                            resampled_particle_probs = resampled_particle_probs.squeeze(0)
+                            resampled_particle_probs = resampled_particle_probs / torch.sum(resampled_particle_probs, dim=1, keepdim=True)
+
+                        # as long as propose ratio is greater than 0.0, execute particle proposing step
+                        if self.propose_ratio > 0.0:
+                            
+                            # proposed particles
+                            proposed_particles = self.propose_particles(phi, num_proposed, state_mins, state_maxs, xy_only)
+                            proposed_particles = proposed_particles.squeeze(0)
+                            proposed_particle_probs = torch.ones(batch_size, num_proposed) / num_proposed
+
+                        # combine standard particles (particles that were resampled in the beginning of the loop and went through measurement update) with proposed particles
+                        if self.propose_ratio == 1.0:
+                            
+                            # then all of the proposed particles are used in the new particle set
+                            # particles[:, :, :2] = proposed_particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                            particle_probs = proposed_particle_probs
+
+                        # if propose_ratio is 0
+                        elif self.propose_ratio == 0.0:
+                            
+                            # then all of the resampled particles are used in the new particle set
+                            # particles[:, :, :2] = resampled_particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                            particle_probs = resampled_particle_probs
+
+                        # otherwise, the new particle set is a combination of resampled (standard) particles and proposed particles --> propose ratio = ratio of proposed to resampled particles
+                        else:
+                            
+                            # prepare to combine resampled particles and proposed particle probabilities
+                            resampled_particle_probs *= (num_resampled_float / self.num_particles_float)
+                            proposed_particle_probs *= (num_proposed_float / self.num_particles_float)
+
+                            # combine resampled and proposed particles
+                            particles = torch.cat([resampled_particles, proposed_particles], dim=1) # concat in num_particles dimension [batch_size, num_particles, state_dim]
+                            # particles[:, :, :2] = particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                            particle_probs = torch.cat([resampled_particle_probs, proposed_particle_probs], dim=1) # concat in num_particles dimension [batch_size, num_particles]
+
+                        # normalise probabilites
+                        particle_probs /= torch.sum(particle_probs, dim=1, keepdim=True)
+
+                        # add particles and particle probabilities from this timestep to the list
+                        particle_list[:, t, :, :] = particles
+                        particle_prob_list[:, t, :] = particle_probs
+
+                    # disable ole network and just have the particle_prob_list be uniform probability every sequence
+                    particle_prob_list = torch.ones([batch_size, seq_len, num_particles], dtype=torch.float64) / num_particles
+
+                    # convert particle_list to robot frame
+                    particle_list
+                    # compute loss
+                    val_loss = loss_fn(batch_contacts, particle_list, particle_prob_list, q_r_step_sizes, self.world, xy_only)
+
+                # track training loss at each epoch
+                val_loss_list[epoch] = val_loss
+
+            # increment epoch
+            epoch += 1
+
+        # plot training and validation loss
+        epochs = range(1, num_epochs_pp+1)
+        fig, axs = plt.subplots(2, figsize=(8, 8))
+        axs[0].plot(epochs, train_loss_list, label='Training loss')
+        axs[0].plot(epochs, val_loss_list, label='Validation loss')
+
+        # labels and axes
+        axs[0].set_xlabel('Epochs')
+        axs[0].set_ylabel('Loss')
+        axs[0].set_title('Loss over epochs for particle proposer')
+        axs[0].legend()
+
+        # TRAINING THE OBSERVATION LIKELIHOOD ESTIMATOR
+        optimiser_OLE = torch.optim.Adam(self.obs_like_estimator.parameters(), lr=learning_rate)
+        loss_fn = self.OLE_loss_fn
+
+        # initialise variables needed in the training loop
+        epoch = 0
+        train_loss_list_OLE = np.zeros((num_epochs_ole,))
+        val_loss_list_OLE = np.zeros((num_epochs_ole,))
+
+        # training loop for OLE
+        while epoch < num_epochs_ole:
+            # print the epoch number at the start of each epoch
+            print(f"Epoch {epoch+1}/{num_epochs_ole}")
+
+            # training loop: for each epoch, go through multiple batches --> e.g. q_o batch has dimensions [batch_size, seq_len, 3]
+            for i, batch in enumerate(train_dataloader):
+                # load to gpu 
+                batch = {k: v.float().to(self.device) for k, v in batch.items()}
+
+                # convert batch such that it only contains data from contact event timesteps
+                batch_contacts_ole = get_batch_contacts(batch, num_contacts_desired) # 'q_o': [batch_size, 1, 3], 'q_r': [batch_size, num_contacts_desired, 2]
+
+                # compute loss
+                train_loss_OLE = loss_fn(batch_contacts_ole, means, stds, self.world.obj_dims, self.world.r_robot)
+
+                # backward and optimize
+                optimiser_OLE.zero_grad()
+                train_loss_OLE.backward()
+                optimiser_OLE.step()
+
+            # track training loss at each epoch
+            train_loss_list_OLE[epoch] = train_loss_OLE
+
+            # validation loop
+            with torch.no_grad():
+                val_loss_OLE = 0.0
+                for i, batch in enumerate(val_dataloader):
+                    # load to gpu 
+                    batch = {k: v.float().to(self.device) for k, v in batch.items()}
+
+                    # convert batch such that it only contains data from contact event timesteps
+                    batch_contacts_ole = get_batch_contacts(batch, num_contacts_desired) # 'q_o': [batch_size, 1, 3], 'q_r': [batch_size, num_contacts_desired, 2]
+
+                    # sequence length is essentially now the number of contact events as this is the number of times we will be applying belief update loop
+                    seq_len = num_contacts_desired
+
+                    # compute validation loss
+                    val_loss_OLE = loss_fn(batch_contacts_ole, means, stds, self.world.obj_dims, self.world.r_robot)
+
+                val_loss_list_OLE[epoch] = val_loss_OLE
+
+            # increment epoch
+            epoch += 1
+
+        # plot training and validation loss
+        epochs = range(1, num_epochs_ole+1)
+        axs[1].plot(epochs, train_loss_list_OLE, label='Training loss')
+        axs[1].plot(epochs, val_loss_list_OLE, label='Validation loss')
+
+        # labels and axes
+        axs[1].set_xlabel('Epochs')
+        axs[1].set_ylabel('Loss')
+        axs[1].set_title('Loss over epochs for observation likelihood estimator')
+        axs[1].legend()
+        fig.tight_layout()
+
+        # TRAINING THE NEGATIVE PROPOSER
+        optimiser_np = torch.optim.Adam(self.negative_proposer.parameters(), lr=learning_rate)
+        loss_fn_np = loss_fn_NP()
+
+        # initialise variables needed in the training loop
+        epoch_np = 0
+        train_loss_list_np = np.zeros((num_epochs_np,))
+        val_loss_list_np = np.zeros((num_epochs_np,))
+
+        # training loop for negative proposer
+        while epoch < num_epochs_np:
+            # print the epoch number at the start of each epoch
+            print(f"Epoch {epoch+1}/{num_epochs_np}")
+
+            # training loop: for each epoch, go through multiple batches --> e.g. q_o batch has dimensions [batch_size, seq_len, 3]
+            for i, batch in enumerate(train_dataloader):
+                # load to gpu 
+                batch = {k: v.float().to(self.device) for k, v in batch.items()}
+
+                # convert batch such that it only contains data from contact event timesteps
+                batch_contacts = get_batch_contacts(batch, num_contacts_desired) # 'q_o': [batch_size, 1, 3], 'q_r': [batch_size, num_contacts_desired, 2]
+
+                # sequence length is essentially now the number of contact events as this is the number of times we will be applying belief update loop
+                seq_len = num_contacts_desired
+                
+                # initialisation
+                particle_list = torch.zeros([batch_size, seq_len, num_particles, self.state_dim], dtype=torch.float64, device=self.device)
+                particles = torch.zeros(batch_size, num_particles, self.state_dim)
+                phi = (torch.rand(batch_size, 1) * 2 * math.pi) - math.pi # sample random phi from between -pi and pi
+                state_mins = torch.from_numpy(q_o_r_mins).to(self.device)
+                state_maxs = torch.from_numpy(q_o_r_maxs).to(self.device)
+                particles = self.propose_particles(phi, num_particles, state_mins, state_maxs, xy_only) # [batch_size, num_particles, state_dim]
+                particles = particles.squeeze(0)
+                particle_list[:, 0, :, :] = particles
+
+                particle_prob_list = torch.zeros([batch_size, seq_len, num_particles], dtype=torch.float64, device=self.device)
+                particle_probs = torch.zeros(batch_size, num_particles)
+                particle_probs = self.measurement_update(phi, particle_list[:, 0, :, :], means, stds) # [batch_size, num_particles] = [20, 100]
+                particle_probs = particle_probs.squeeze(0)
+                particle_probs = particle_probs / torch.sum(particle_probs, dim=1, keepdim=True) # normalise
+                particle_prob_list[:, 0, :] = particle_probs
+
+                # convert particles to world frame
+                particles[:, :, :2] = particles[:, :, :2] + batch_contacts['q_r'][:, 0:1, :2]
+                particle_list[:, 0, :, :] = particles
+
+                # for each time step, i.e. each contact event
+                for t in range(seq_len):
+                    # determine number of particles to propose and number of particles to resample, based on propose ratio
+                    # propose_ratio is ratio of proposed to resampled particles --> this follows an exponential function (gamma)^(t-1)
+                    num_proposed_float = torch.round(torch.tensor((self.propose_ratio ** int(t+1))) * self.num_particles_float)
+                    num_proposed = num_proposed_float.int()
+                    num_resampled_float = self.num_particles_float - num_proposed_float
+                    num_resampled = num_resampled_float.int()
+
+                    # as long as propose ratio is less than 1.0, execute resampling and measurement update
+                    if self.propose_ratio < 1.0:
+                        # stop gradients flowing through resampling step
+                        with torch.no_grad():
+                            # simple resampling --> for batches
+                            resampled_indices = np.zeros((batch_size, num_resampled.item()))
+
+                            for b in range(batch_size):
+                                # get the particle probabilities for the current batch item
+                                current_probs = particle_probs[b, :]
+                                
+                                # resample indices for this batch item
+                                indices = np.random.choice(np.arange(num_particles), torch.Tensor.numpy(num_resampled), p=torch.Tensor.numpy(current_probs))
+                                # append the resampled indices for this batch item
+                                resampled_indices[b, :] = indices
+
+                            # resampled particles for batch
+                            resampled_particles = torch.zeros(batch_size, num_resampled, 3)
+
+                            for b in range(batch_size):
+                                resampled_particles[b, :, :] = particles[b, resampled_indices[b, :], :]
+
+                        # get phi
+                        phi = batch_contacts['phi'][:, t, :] # [batch_size, 1]
+
+                        # measurement update
+                        resampled_particles[:, :, :2] = resampled_particles[:, :, :2] - batch_contacts['q_r'][:, t:t+1, :] # convert particles to robot frame
+                        resampled_particle_probs = self.measurement_update(phi, resampled_particles, means, stds)
+                        resampled_particle_probs = resampled_particle_probs.squeeze(0)
+                        resampled_particle_probs = resampled_particle_probs / torch.sum(resampled_particle_probs, dim=1, keepdim=True)
+
+                    # as long as propose ratio is greater than 0.0, execute particle proposing step
+                    if self.propose_ratio > 0.0:
+                        
+                        # proposed particles
+                        proposed_particles = self.propose_particles(phi, num_proposed, state_mins, state_maxs, xy_only)
+                        proposed_particles = proposed_particles.squeeze(0)
+                        proposed_particle_probs = torch.ones(batch_size, num_proposed) / num_proposed
+
+                    # combine standard particles (particles that were resampled in the beginning of the loop and went through measurement update) with proposed particles
+                    if self.propose_ratio == 1.0:
+                        
+                        # then all of the proposed particles are used in the new particle set
+                        # particles[:, :, :2] = proposed_particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                        particle_probs = proposed_particle_probs
+
+                    # if propose_ratio is 0
+                    elif self.propose_ratio == 0.0:
+                        
+                        # then all of the resampled particles are used in the new particle set
+                        # particles[:, :, :2] = resampled_particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                        particle_probs = resampled_particle_probs
+
+                    # otherwise, the new particle set is a combination of resampled (standard) particles and proposed particles --> propose ratio = ratio of proposed to resampled particles
+                    else:
+                        
+                        # prepare to combine resampled particles and proposed particle probabilities
+                        resampled_particle_probs = resampled_particle_probs * (num_resampled_float / self.num_particles_float)
+                        proposed_particle_probs = proposed_particle_probs * (num_proposed_float / self.num_particles_float)
+
+                        # combine resampled and proposed particles
+                        particles = torch.cat([resampled_particles, proposed_particles], dim=1) # concat in num_particles dimension [batch_size, num_particles, state_dim]
+                        # particles[:, :, :2] = particles[:, :, :2] + batch_contacts['q_r'][:, t:t+1, :] # convert particles to world frame
+                        particle_probs = torch.cat([resampled_particle_probs, proposed_particle_probs], dim=1) # concat in num_particles dimension [batch_size, num_particles]
+
+                    # normalise probabilites
+                    particle_probs = particle_probs / torch.sum(particle_probs, dim=1, keepdim=True)
+
+                    # add particles and particle probabilities from this timestep to the list
+                    particle_list[:, t, :, :] = particles
+                    particle_prob_list[:, t, :] = particle_probs
+
+                # disable ole network and just have the particle_prob_list be uniform probability every sequence
+                particle_prob_list = torch.ones([batch_size, seq_len, num_particles], dtype=torch.float64) / num_particles
+
+                # experiment: compute loss only for final timestep
+                batch_contacts['q_o_r'] = batch_contacts['q_o_r'][:, -2:-1, :]
+
+                # compute loss --> experiment: compute loss only using final contact event timestep particle set
+                train_loss_np = loss_fn_np(batch_contacts, particle_list[:, -2:-1, :, :], particle_prob_list[:, -2:-1, :], q_r_step_sizes, self.world, xy_only)
+
+                # backward and optimize
+                optimiser_np.zero_grad()
+                train_loss_np.backward()
+                optimiser_np.step()
+
+            # track training loss at each epoch
+            train_loss_list_np[epoch_np] = train_loss_np
+
+            # increment epoch
+            epoch_np += 1
+
+        # plot training and validation loss
+        epochs_np = range(1, num_epochs_np+1)
+        fig_np, axs_np = plt.subplots(1, figsize=(8, 8))
+        axs_np[0].plot(epochs_np, train_loss_list_np, label='Training loss')
+
+        # labels and axes
+        axs_np[0].set_xlabel('Epochs')
+        axs_np[0].set_ylabel('Loss')
+        axs_np[0].set_title('Loss over epochs for negative proposer')
+        axs_np[0].legend()
+        fig_np.tight_layout()
+
+    # testing particle update given an observation --> single timestep belief update performance testing
     def test(self, state_mins, state_maxs, means, stds, xy_only):
         
         with torch.no_grad():
@@ -412,7 +971,8 @@ class DPF():
             self.plot_particle_weights(particles, weights, q_r_achieved, s=10)
 
     # tesing particle update and resampling with non-contact-only trajectories
-    def test_resampling_non_contact_only(self, state_mins, state_maxs, means, stds, xy_only):
+    # every time there is a contact event, resampling is executed
+    def test_resampling_non_contact_only(self, state_mins, state_maxs, means, stds, xy_only, compute_metrics):
         
         def get_phi(q_r_hist, contact_idx, n):
             # for the first contact event, calculate phi observation
@@ -435,9 +995,9 @@ class DPF():
 
             # perform rollouts of length 100, until a trajectory with desired number of observations is found
             observation_count = 0
-            desired_observation_count = 18
-            while observation_count != desired_observation_count:
-                q_r_hist, o_hist, a_hist = self.world.rollout(300, self.world.qo_gt.copy())
+            desired_observation_count = 10 # desired minimum
+            while observation_count < desired_observation_count:
+                q_r_hist, o_hist, a_hist = self.world.rollout(1000, self.world.qo_gt.copy())
                 observation_count = np.sum(o_hist)
 
             # only keep bits of sequence around positive contact measurements --> truncate trajectory
@@ -453,7 +1013,10 @@ class DPF():
             contact_idx = np.where(o_hist==1)[0]
 
             # plot sample trajectory
-            self.world.plot_rollout(q_r_hist, o_hist)
+            if compute_metrics == False:
+                self.world.plot_rollout(q_r_hist, o_hist)
+            else:
+                pass
 
             # initialisation
             particle_list = torch.zeros(observation_count, self.num_particles_test, self.state_dim)
@@ -542,57 +1105,130 @@ class DPF():
                 particle_list[i, :, :] = particles
                 particle_prob_list[i, :] = particle_probs
 
-            # plot belief update
-            rows, cols = 6, 3
-            fig, axs = plt.subplots(rows, cols, figsize=(6*cols, 6*rows))
+            if compute_metrics == False:
+                # plot belief update
+                cols = 3
+                rows = (np.ceil(observation_count / cols)).astype(int)
+                fig, axs = plt.subplots(rows, cols, figsize=(6*cols, 6*rows))
 
-            # flatten the axs array to make indexing easier
-            axs = axs.flatten()
+                # flatten the axs array to make indexing easier
+                axs = axs.flatten()
 
-            for i in range(observation_count):
+                for i in range(observation_count):
+                    
+                    # track these values so that we can differentiate when plotting proposed particles vs resampled particles
+                    num_proposed_float = torch.round(torch.tensor((self.propose_ratio ** int(i))) * self.num_particles_test_float)
+                    num_proposed = num_proposed_float.int()
+                    num_resampled_float = self.num_particles_test_float - num_proposed_float
+                    num_resampled = num_resampled_float.int()
+                    
+                    # for plotting intermediate trajectory --> portion of truncated trajectory to plot
+                    if i > 0:
+                        q_r_hist_plot = q_r_hist[contact_idx[i-1]:contact_idx[i], :]
+                        a_hist_plot = a_hist[contact_idx[i-1]:contact_idx[i], :]
+                        o_hist_plot = o_hist[contact_idx[i-1]:contact_idx[i]]
+
+                    # get robot position at particlular contact event
+                    self.world.q_r_0 = q_r_hist[contact_idx[i]]
+
+                    # plotting
+                    axs[i].set_aspect('equal')
+                    axs[i].set_xlim(self.world.bounds[0])
+                    axs[i].set_ylim(self.world.bounds[1])
+                    axs[i].set_title("Contact event " + str(i+1))
+                    plot_robot(axs[i], self.world.q_r_0, self.world.r_robot, color=robot_color)
+                    plot_object(axs[i], self.world.qo_gt, self.world.obj_dims, color=gt_color)
+
+                    # proportion of the total particles that we want to actually plot
+                    ratio_to_plot = 0.2
+
+                    if i == 0:
+                        plot_object_belief(axs[i], particle_list[i, :int(np.round(self.num_particles_test*ratio_to_plot)), :], particle_prob_list[i, :int(np.round(self.num_particles_test*ratio_to_plot))], self.world.obj_dims, particle_color='blue')
+                    else:
+                        plot_object_belief(axs[i], particle_list[i, num_proposed:num_proposed+(int(np.round(num_proposed*ratio_to_plot))), :], particle_prob_list[i, num_proposed:num_proposed+(int(np.round(num_proposed*ratio_to_plot)))], self.world.obj_dims, particle_color='blue')
+                        plot_object_belief(axs[i], particle_list[i, 0:int(np.round(num_resampled*ratio_to_plot)), :], particle_prob_list[i, 0:int(np.round(num_resampled*ratio_to_plot))], self.world.obj_dims, particle_color='green')
+
+                    # plotting intermediate trajectory
+                    if i > 0:
+                        axs[i].plot(q_r_hist_plot[:, 0], q_r_hist_plot[:, 1], 'o-', color=robot_color, alpha=0.5)
+
+                    # for last contact event / plot
+                    if i == (observation_count - 1):
+                        # plot the particle with the highest probability
+                        max_idx = torch.argmax(particle_prob_list[i, :])
+                        max_value = particle_prob_list[i, max_idx:max_idx+1]
+                        max_prob_particle = particle_list[i, max_idx:max_idx+1, :]
+                        plot_object_belief(axs[i], max_prob_particle, torch.tensor([1]), self.world.obj_dims, particle_color='orange')
+                        
+                        # take the particle set and average x, y, theta across the particle set --> plot the average
+                        avg_particle = torch.mean(particle_list[i, :, :], dim=0)
+                        plot_object_belief(axs[i], avg_particle[None, :], torch.tensor([1]), self.world.obj_dims, particle_color='yellow')
+
+                # remove any unused subplots
+                for j in range(observation_count, rows * cols):
+                    fig.delaxes(axs[j])
                 
-                # track these values so that we can differentiate when plotting proposed particles vs resampled particles
-                num_proposed_float = torch.round(torch.tensor((self.propose_ratio ** int(i))) * self.num_particles_test_float)
-                num_proposed = num_proposed_float.int()
-                num_resampled_float = self.num_particles_test_float - num_proposed_float
-                num_resampled = num_resampled_float.int()
-                
-                # for plotting intermediate trajectory --> portion of truncated trajectory to plot
-                if i > 0:
-                    q_r_hist_plot = q_r_hist[contact_idx[i-1]:contact_idx[i], :]
-                    a_hist_plot = a_hist[contact_idx[i-1]:contact_idx[i], :]
-                    o_hist_plot = o_hist[contact_idx[i-1]:contact_idx[i]]
-
-                # get robot position at particlular contact event
-                self.world.q_r_0 = q_r_hist[contact_idx[i]]
-
-                # plotting
-                axs[i].set_aspect('equal')
-                axs[i].set_xlim(self.world.bounds[0])
-                axs[i].set_ylim(self.world.bounds[1])
-                axs[i].set_title("Contact event " + str(i+1))
-                plot_robot(axs[i], self.world.q_r_0, self.world.r_robot, color=robot_color)
-                plot_object(axs[i], self.world.qo_gt, self.world.obj_dims, color=gt_color)
-
-                # proportion of the total particles that we want to actually plot
-                ratio_to_plot = 0.2
-
-                if i == 0:
-                    plot_object_belief(axs[i], particle_list[i, :int(np.round(self.num_particles_test*ratio_to_plot)), :], particle_prob_list[i, :int(np.round(self.num_particles_test*ratio_to_plot))], self.world.obj_dims, particle_color='blue')
-                else:
-                    plot_object_belief(axs[i], particle_list[i, num_proposed:num_proposed+(int(np.round(num_proposed*ratio_to_plot))), :], particle_prob_list[i, num_proposed:num_proposed+(int(np.round(num_proposed*ratio_to_plot)))], self.world.obj_dims, particle_color='blue')
-                    plot_object_belief(axs[i], particle_list[i, 0:int(np.round(num_resampled*ratio_to_plot)), :], particle_prob_list[i, 0:int(np.round(num_resampled*ratio_to_plot))], self.world.obj_dims, particle_color='green')
-
-                # plotting intermediate trajectory
-                if i > 0:
-                    axs[i].plot(q_r_hist_plot[:, 0], q_r_hist_plot[:, 1], 'o-', color=robot_color, alpha=0.5)
-
-            # Remove any unused subplots
-            for j in range(observation_count, rows * cols):
-                fig.delaxes(axs[j])
+                fig.tight_layout()
             
-            fig.tight_layout()
+            else:
+                pass
 
+        if compute_metrics == True:
+            # consider final timestep in belief update loop
+            i = observation_count - 1
+
+            # obtain ground truth object state
+            q_o = self.world.qo_gt
+
+            # obtain particle with max probability
+            max_idx = torch.argmax(particle_prob_list[i, :])
+            max_value = particle_prob_list[i, max_idx:max_idx+1]
+            max_prob_particle = particle_list[i, max_idx:max_idx+1, :] # particle is in world frame
+            max_prob_particle = max_prob_particle.squeeze(0)
+
+            # squared error based on particle with max probability
+            max_particle_squared_error_xy, max_particle_squared_error_theta = compute_squared_error(q_o, max_prob_particle)
+
+            # obtain average particle of the particle set
+            avg_particle = torch.mean(particle_list[i, :, :], dim=0)
+            avg_particle = avg_particle.squeeze(0) # particle is in world frame
+
+            # squared error based on average particle
+            avg_particle_squared_error_xy, avg_particle_squared_error_theta = compute_squared_error(q_o, avg_particle)
+
+            return max_particle_squared_error_xy, max_particle_squared_error_theta, avg_particle_squared_error_xy, avg_particle_squared_error_theta
+        
+        else:
+            pass
+
+    def compute_metrics(self, state_mins, state_maxs, means, stds, xy_only, compute_metrics, num_test_samples):
+        # initialise vectors to store squared errors
+        MSE_max_particle_xy = torch.zeros(num_test_samples)
+        MSE_max_particle_theta = torch.zeros(num_test_samples)
+        MSE_avg_particle_xy = torch.zeros(num_test_samples)
+        MSE_avg_particle_theta = torch.zeros(num_test_samples)
+
+        # generate test samples and record squared errors
+        i = 0
+        for i in tqdm.tqdm(range(num_test_samples)):
+            max_particle_squared_error_xy, max_particle_squared_error_theta, avg_particle_squared_error_xy, avg_particle_squared_error_theta = self.test_resampling_non_contact_only(state_mins, state_maxs, means, stds, xy_only, compute_metrics)
+            MSE_max_particle_xy[i] = max_particle_squared_error_xy
+            MSE_max_particle_theta[i] = max_particle_squared_error_theta
+            MSE_avg_particle_xy[i] = avg_particle_squared_error_xy
+            MSE_avg_particle_theta[i] = avg_particle_squared_error_theta
+
+        MSE_max_particle_xy = torch.mean(MSE_max_particle_xy)
+        MSE_max_particle_theta = torch.mean(MSE_max_particle_theta)
+        MSE_avg_particle_xy = torch.mean(MSE_avg_particle_xy)
+        MSE_avg_particle_theta = torch.mean(MSE_avg_particle_theta)
+
+        print('xy MSE for particle with max probability: ', MSE_max_particle_xy.item())
+        print('theta MSE for particle with max probability: ', MSE_max_particle_theta.item())
+        print('xy MSE for average particle from the final belief: ', MSE_avg_particle_xy.item())
+        print('theta MSE for average particle from the final belief: ', MSE_avg_particle_theta.item())
+
+        return MSE_max_particle_xy, MSE_max_particle_theta, MSE_avg_particle_xy, MSE_avg_particle_theta
+    
     # visualisation of particles and their weights
     def plot_particle_weights(self, particles, weights, q_r_achieved, s):
         plt.figure(figsize=(7.5, 7.5), dpi=100)
@@ -899,9 +1535,9 @@ class ObsLikelihoodEstimator(nn.Module):
     def __init__(self, min_obs_likelihood):
         super().__init__()
         self.linear_stack = nn.Sequential(
-            nn.Linear(5, 32),
+            nn.Linear(5, 20),
             nn.ReLU(),
-            nn.Linear(32, 1),
+            nn.Linear(20, 1),
             nn.Sigmoid(),
         )
         self.min_obs_likelihood = min_obs_likelihood
@@ -912,6 +1548,28 @@ class ObsLikelihoodEstimator(nn.Module):
         x = x * (1 - self.min_obs_likelihood) + self.min_obs_likelihood # ensures that all probabilities outputted are higher than minimum observation likelihood (a design parameter)
         return x
     
+# class that defines orientation predictor network
+class NegativeProposer(nn.Module):
+
+    # initialise neural network architecture
+    def __init__(self):
+        super().__init__()
+        self.linear_stack = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.ReLU(),
+            nn.Linear(16, 16),
+            nn.ReLU(),
+            nn.Linear(16, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid(), # sigmoid maps to probability between 0 and 1
+        )
+
+    # define the forward pass of the network (how input data x moves through network layers)
+    def forward(self, x):
+        x = self.linear_stack(x)
+        return x
+
 # class which inherits from Dataset Pytorch class --> allows us to obtain one subsequence sample from our dataset
 class TrajectoriesDataset(torch.utils.data.Dataset):
     def __init__(self, data, seq_len):
@@ -934,7 +1592,9 @@ class TrajectoriesDataset(torch.utils.data.Dataset):
             'q_o': self.data['q_o'][traj_idx, :, :],
             'q_r': self.data['q_r'][traj_idx, start_idx:end_idx, :],
             'q_o_r': self.data['q_o_r'][traj_idx, start_idx:end_idx, :],
-            'phi': self.data['phi'][traj_idx, start_idx:end_idx, :]
+            'o': self.data['o'][traj_idx, start_idx:end_idx, :],
+            'phi': self.data['phi'][traj_idx, start_idx:end_idx, :],
+            'cp': self.data['cp'][traj_idx, start_idx:end_idx, :]
         }
         return sample
 
@@ -993,7 +1653,27 @@ class loss_OLE(nn.Module):
             # maximise probability at true states, minimise probability at all other states
             true_state_probs = torch.diag(OLE_out) # [batch_size]
             other_state_probs = OLE_out - torch.diag(true_state_probs) # [batch_size, batch_size]
-            loss_at_t = torch.sum(-torch.log(true_state_probs)) + torch.sum(-torch.log(1.0 - other_state_probs)) # this line does not normalise the loss
+            loss_at_t = torch.sum(-torch.log(true_state_probs)) / (batch_size) + torch.sum(-torch.log(1.0 - other_state_probs)) / (batch_size * (batch_size - 1)) # normalise the loss such that (correct -> 1, incorrect -> 0)
             loss += loss_at_t
         
+        return loss
+    
+class loss_fn_NP(nn.Module):
+    def __init__(self):
+        super(loss_fn_NP, self).__init__()
+
+    def forward(self, batch, particle_list, particle_prob_list, state_step_sizes, world, xy_only):
+        # parameters and inputs
+        std = 0.02
+        particle_std = 0.02
+        seq_len = particle_list.shape[1]
+        
+        # squared distance computation
+        sq_distance = compute_sq_distance(particle_list, torch.cat((batch['q_o_r'], torch.tile(batch['q_o'][:, :, 2:3], (1, seq_len, 1))), dim=-1), state_step_sizes, xy_only) # shape: [batch_size, seq_len, num_particles]
+        
+        # gaussian computation
+        std_tensor = torch.tensor(2.0 * np.pi * (std ** 2.0))
+        activations = (particle_prob_list / torch.sqrt(std_tensor)) * torch.exp(-sq_distance / (2.0 * (particle_std ** 2.0))) # shape: [batch_size, seq_len, num_particles]
+        loss = torch.mean(-torch.log(1e-16 + torch.sum(activations, dim=-1)))
+
         return loss
