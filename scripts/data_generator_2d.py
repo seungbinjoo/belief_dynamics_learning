@@ -57,13 +57,13 @@ def generate_dataset_contact_only(world, num_sequences, num_steps_per_sequence=1
     return data
 
 # data generation for contact-only trajectories, where the observation is phi
-def generate_dataset_phi(world, num_sequences, num_steps_per_sequence=3):
+def generate_dataset_phi(world, num_sequences, num_steps_per_sequence):
     data = []
     for i in tqdm.tqdm(range(num_sequences)):
         
         observation_count = 0
         # perform rollouts until a trajectory with 1 or more observations is found
-        while observation_count < 3:
+        while observation_count < 10:
             # sample a new ground truth pose 
             world.sample_gt_object_pose()
             # sample a new robot pose
@@ -71,7 +71,7 @@ def generate_dataset_phi(world, num_sequences, num_steps_per_sequence=3):
             # check for initial contact, resample robot pose if in contact
             d, closest_point = dist_to_object(world.q_r_0, world.qo_gt, world.obj_dims, world.r_robot)
             closest_point = closest_point - world.q_r_0
-            while d < 0: 
+            while d < 0:
                 world.sample_robot_pose()
                 d, closest_point = dist_to_object(world.q_r_0, world.qo_gt, world.obj_dims, world.r_robot)
                 closest_point = closest_point - world.q_r_0
@@ -97,7 +97,7 @@ def generate_dataset_phi(world, num_sequences, num_steps_per_sequence=3):
                 closest_point_hist.append(closest_point)
 
         # dataset: q_o, q_r, phi
-        data.append((world.qo_gt, q_r_hist, phi_hist, closest_point_hist))
+        data.append((world.qo_gt, q_r_hist, o_hist, phi_hist, closest_point_hist))
 
     return data
 
@@ -115,8 +115,8 @@ if __name__ == "__main__":
     world = World2D(num_particles, qo_gt, dim_object, sigma_pos, 
                     qr_0, r_robot, dt)
     # generate a dataset
-    data = generate_dataset_phi(world, 100, 3)
+    data = generate_dataset_phi(world, 100, 1000)
     # save the dataset to a file
-    save_path = os.path.join(root, '../data/phi_data_min_3_contacts_seq_len_3_test_100_trajectories.pkl')
+    save_path = os.path.join(root, '../data/phi_data_min_10_contacts_seq_len_1000_test_100_trajectories.pkl')
     with open(save_path, 'wb') as f: 
         pickle.dump(data, f)
