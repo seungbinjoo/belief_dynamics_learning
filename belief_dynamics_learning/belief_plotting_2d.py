@@ -22,6 +22,9 @@ def plot_object(ax, qo, dim_object, color='blue', alpha=1., zorder=None):
     elif color == 'yellow':
         edgecolor = 'yellow'
         zorder = 11
+    elif color == 'black':
+        edgecolor = 'black'
+        zorder = 11
     elif color == 'lightpink': 
         edgecolor='palevioletred'
         zorder = 10
