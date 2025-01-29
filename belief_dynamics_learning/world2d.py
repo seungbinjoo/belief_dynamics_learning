@@ -126,7 +126,7 @@ class World2D:
         """
         qo_gt_new = np.zeros(3)
         qo_gt_new[:2] = np.random.uniform(self.sample_bounds[:, 0], self.sample_bounds[:, 1])
-        qo_gt_new[2] = np.random.uniform(-np.pi, np.pi) # used to be: (0, np.pi)
+        qo_gt_new[2] = np.random.uniform(0, np.pi) # used to be: (-np.pi, np.pi)
         self.qo_gt = qo_gt_new
         # print("New ground truth pose: ", self.qo_gt)
 
@@ -159,6 +159,8 @@ class World2D:
         ax.set_aspect('equal')
         ax.set_xlim(self.bounds[0])
         ax.set_ylim(self.bounds[1])
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
         plot_robot(ax, self.q_r_0, self.r_robot, color=robot_color)
         plot_object(ax, self.qo_gt, self.obj_dims, color=gt_color)
         plot_object_belief(ax, self.particles, self.weights, self.obj_dims)
@@ -210,7 +212,7 @@ class World2D:
                     loc='upper left', fontsize=14)
         plt.show()
 
-    def step(self, x, q_o, sigma_a=0.12): # if sigma_a is too high, the "while x_diff..." loop runs too often
+    def step(self, x, q_o, sigma_a=0.05): # if sigma_a is too high, the "while x_diff..." loop runs too often
         """
         Sample a random walk motion model for the robot.
         x_t = x_{t-1} + v_{t-1} * dt + 1/2 * a_t * dt^2 
@@ -227,14 +229,29 @@ class World2D:
         margin = 0.0335 + 0.001
         mean_a = np.zeros(2)
 
-        # keep sampling acceleration until we ensure that acceleration is small enough so that x_diff isn't too large, which could cause the robot to clip through the object
+        # set maximum duration for the while loop that resamples acceleration vector (in seconds)
+        max_duration = 1.0  # 1 second
+        # record the start time
+        start_time = time.time()
+
         while np.abs(x_diff) > np.abs(np.min(self.obj_dims) - margin):
+            # check if the loop has been running longer than max_duration
+            if time.time() - start_time > max_duration:
+                break  # exit the loop if time limit is exceeded
+
             a = np.random.normal(mean_a, sigma_a)
             x_new = np.dot(self.A, x) + np.dot(self.B, a)
             x_diff = np.linalg.norm(x_new[:2] - x[:2])
+
+        # Handle the case where the loop exited due to timeout --> reset velocities to zero
+        # (too much velocity has been accumulated and no matter what acceleration is chosen,
+        # x_diff will too large)
+        if np.abs(x_diff) > np.abs(np.min(self.obj_dims) - margin):
+            x_new[2] = 0
+            x_new[3] = 0
         
         # check for contact
-        d, _ = dist_to_object(x_new[:2], q_o, self.obj_dims, self.r_robot) 
+        d, _ = dist_to_object(x_new[:2], q_o, self.obj_dims, self.r_robot)
         # check if within bounds
         within_bounds = (self.bounds[0, :] <= x_new[:2]) & (x_new[:2] <= self.bounds[1, :])
 
@@ -254,27 +271,20 @@ class World2D:
             q_r_o = R_object.T @ (x_new[:2] - q_o[:2])
             # find closest point on object surface
             q_r_o_normalized = q_r_o / (self.obj_dims/2) # 1 if on the surface
-            # print('q_r_o_normalised:', q_r_o_normalized)
             if np.abs(q_r_o_normalized[0]) > 1 and np.abs(q_r_o_normalized[1]) > 1:
                 # Closest point is on the corner
                 q_o_closest = np.sign(q_r_o_normalized)
             elif np.abs(q_r_o_normalized[0]) > np.abs(q_r_o_normalized[1]):
                 # move to x border
                 q_o_closest = np.array([np.sign(q_r_o_normalized[0]), q_r_o_normalized[1]])
-                # print('q_o_closest in if statement:', q_o_closest)
             else:
                 # move to y border
                 q_o_closest = np.array([q_r_o_normalized[0], np.sign(q_r_o_normalized[1])])
             q_o_closest *= self.obj_dims/2
-            # print('q_o_closest after scaling:', q_o_closest)
             dq_r_o_new = q_r_o - q_o_closest
-            # print('dq_r_o_new:', dq_r_o_new)
             dq_r_o_new *= self.r_robot / np.linalg.norm(dq_r_o_new)
-            # print('dq_r_o_new scaled:', dq_r_o_new)
             q_r_o_new = q_o_closest + dq_r_o_new
-            # print('q_r_o_new:', q_r_o_new)
             x_new[:2] = np.dot(R_object, q_r_o_new) + q_o[:2]
-            # self.plot_single_step(q_des, x_new[:2], q_o)
 
             # test whether object is intersecting with robot
             # d_test, _test = dist_to_object(x_new[:2], q_o, self.obj_dims, self.r_robot) 
@@ -313,7 +323,6 @@ class World2D:
             o_hist.append(o)
         return np.array(q_r_hist), np.array(o_hist), np.array(action_hist)
     
-
 if __name__ == '__main__': 
     num_particles = 1000
 
