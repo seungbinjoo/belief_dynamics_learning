@@ -171,7 +171,8 @@ def compute_statistics(data, phi_dataset):
 
     return means, stds, q_o_r_maxs, q_o_r_mins, q_r_step_sizes, q_r_maxs, q_r_mins
 
-# compute squared distance between particle list and the object poses in the batch --> note: scale each dimension by dividing by the step sizes (for a sensible metric across state dimensions)
+# compute squared distance between particle list and the object poses in the batch
+# note: scale each dimension by dividing by the step sizes (for a sensible metric across state dimensions)
 def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes, xy_only):
     
     # compute some parameters
@@ -193,7 +194,7 @@ def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes, xy_only):
     # compute squared distance
     for i in range(state_dim):
         # compute difference
-        diff = particle_list[..., i] - batch_q_o[..., i] # 'diff' has shape [batch_size, seq_len, num_particles] --> note: '...' represents as many ':' as needed to cover all the dimensions
+        diff = particle_list[..., i] - batch_q_o[..., i] # [batch_size, seq_len, num_particles]
 
         # wrap angle for theta
         if i == 2:
@@ -207,58 +208,29 @@ def compute_sq_distance(particle_list, batch_q_o, q_r_step_sizes, xy_only):
         result += (diff/scalings[i]) ** 2
     return result
 
-def compute_sq_distance_other(batch_q_o, num_states_other, buffer):
-    """
-    Args:
-        batch_q_o: [batch_size, 1, state_dim]
-        num_states_other: []
-        buffer: []
-    Returns:
-        sq_distance_other: [batch_size, seq_len, num_states_other, num_states_other, num_states_other]
-    """
-    # x, y, theta should have shapes [batch_size, 1, num_states_other]
-    x_ratio = (batch_q_o[:, :, 0] - (-0.5)) / (0.5 - (-0.5))
-    num_states_other_left = torch.floor(num_states_other * x_ratio) # [batch_size, 1]
-    num_states_other_right = num_states_other - num_states_other_left # [batch_size, 1]
+# compute sq distance but only considering the angle state
+def compute_sq_distance_angle(particle_list, batch_q_o, q_r_step_sizes, xy_only):
+    
+    # compute some parameters
+    batch_size = batch_q_o.shape[0]
+    seq_len = batch_q_o.shape[1]
+    num_particles = particle_list.shape[2]
+    state_dim = batch_q_o.shape[-1]
 
-    x = torch.zeros(batch_q_o.shape[0], batch_q_o.shape[1], num_states_other)
-    for i in range(batch_q_o.shape[0]):
-        x_left = torch.linspace(-0.5, batch_q_o[i, 0, 0].item() - buffer, int(num_states_other_left[i, 0].item()))
-        x_right = torch.linspace(batch_q_o[i, 0, 0].item() + buffer, 0.5, int(num_states_other_right[i, 0].item()))
-        x[i, 0, :] = torch.cat((x_left, x_right))
+    if xy_only == True:
+        assert state_dim == 2
+    
+    # add dimension to tensor containing batch of object poses
+    batch_q_o = batch_q_o[:, :, None, :]
+    assert batch_q_o.shape == (batch_size, seq_len, 1, state_dim)
 
-    y_ratio = (batch_q_o[:, :, 1] - (0.5)) / (1.5 - (0.5))
-    num_states_other_left = torch.floor(num_states_other * y_ratio) # [batch_size, 1]
-    num_states_other_right = num_states_other - num_states_other_left # [batch_size, 1]
+    result = 0.0
+    scaling = 10
+    # compute squared distance
+    diff = particle_list[..., -1] - batch_q_o[..., -1] # [batch_size, seq_len, num_particles]
+    result += (diff/scaling) ** 2
 
-    y = torch.zeros(batch_q_o.shape[0], batch_q_o.shape[1], num_states_other)
-    for i in range(batch_q_o.shape[0]):
-        y_left = torch.linspace(0.5, batch_q_o[i, 0, 1].item() - buffer, int(num_states_other_left[i, 0].item()))
-        y_right = torch.linspace(batch_q_o[i, 0, 1].item() + buffer, 1.5, int(num_states_other_right[i, 0].item()))
-        y[i, 0, :] = torch.cat((y_left, y_right))
-
-    scalings = [1, 1]
-    diff_x = (x - batch_q_o[:, :, 0:1]) / scalings[0] # [batch_size, 1, num_states_other]
-    diff_y = (y - batch_q_o[:, :, 1:2]) / scalings[1] # [batch_size, 1, num_states_other]
-    # diff_theta = (theta - batch_q_o[:, :, 2:3]) / scalings[2] # [batch_size, 1, num_states_other]
-
-    result_x = diff_x ** 2.0 # [batch_size, 1, num_states_other]
-    result_y = diff_y ** 2.0 # [batch_size, 1, num_states_other]
-    # result_theta = diff_theta ** 2.0 # [batch_size, 1, num_states_other]
-
-    sq_distance_other = torch.zeros(batch_q_o.shape[0], batch_q_o.shape[1], num_states_other, num_states_other)
-    # sq_distance_other = torch.zeros(batch_q_o.shape[0], batch_q_o.shape[1], num_states_other, num_states_other, num_states_other)
-
-    # for i in range(num_states_other):
-    #     for j in range(num_states_other):
-    #         for k in range(num_states_other):
-    #             sq_distance_other[:, :, i, j, k] = result_x[:, :, i] + result_y[:, :, j] + result_theta[:, :, k]
-
-    for i in range(num_states_other):
-        for j in range(num_states_other):
-            sq_distance_other[:, :, i, j] = result_x[:, :, i] + result_y[:, :, j]
-
-    return sq_distance_other
+    return result
 
 # method for keeping angles between -pi and pi
 def wrap_angle(angle):
