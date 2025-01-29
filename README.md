@@ -21,8 +21,10 @@ conda install pytorch torchvision -c pytorch
 
 ## Usage
 
-Navigate to `/scripts` directory and run the `data_generator_2d.py`. This will store data generated in `/data` folder.
+Navigate to `/scripts` directory and run the `data_generator_2d.py`. This will store data generated in the `/data` folder.
 
 After this is done, you can prepare the dataset, train, test and visualize the DPF by going through `notebooks/dpf_notebook.ipynb`.
 
 As next steps, you can experiment with hyperparameters in `notebooks/dpf_notebook.ipynb`, different datasets generated from `data_generator_2d.py`, and so on. The DPF implementation, training code, and testing/evauluation code can be found in `belief_dynamics_learning/dpf.py`.
+
+![DPF Example Image](dpf_image.png)
