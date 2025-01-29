@@ -27,4 +27,4 @@ After this is done, you can prepare the dataset, train, test and visualize the D
 
 As next steps, you can experiment with hyperparameters in `notebooks/dpf_notebook.ipynb`, different datasets generated from `data_generator_2d.py`, and so on. The DPF implementation, training code, and testing/evauluation code can be found in `belief_dynamics_learning/dpf.py`.
 
-![DPF Example Image](dpf_image.png)
+![DPF Example Image](poster.png)
