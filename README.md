@@ -1,6 +1,6 @@
 ## Belief Dynamics Learning
 
-This repository contains code for [differentiable particle filters (DPFs)](https://arxiv.org/abs/1805.11122) applied to a setting where a blind robotic manipulator is tasked with grasping objects using contact observations. We use DPFs to learn the belief dynamics and predict the state of an object's pose. We also introduce a negative proposing algorithm to account for the sparsity in contact observaions.
+This repository contains code for [differentiable particle filters (DPFs)](https://arxiv.org/abs/1805.11122) applied to a setting where a blind robotic manipulator is tasked with grasping objects using contact observations. We use DPFs to learn the belief dynamics and predict the state of an object's pose. We also introduce a negative proposing algorithm to account for the sparsity in contact observations.
 
 
 ## Dependencies
